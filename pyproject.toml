@@ -1,0 +1,32 @@
+[project]
+name = "keiba-ai"
+version = "0.1.0"
+description = "競馬予測AI"
+requires-python = ">=3.11.12"
+authors = [
+    {name = "KeibaAI Team"}
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests"
+] 
