@@ -88,28 +88,43 @@ flake8
 ├── KeibaAI/
 │   ├── CODING_STANDARDS.md
 │   ├── README.md
+│   ├── calibration_curve.png
 │   ├── data/
 │   │   ├── processed/
+│   │   ├── race_results/
 │   │   ├── raw/
+│   │   │   ├── 2018.csv
+│   │   │   ├── 2019.csv
+│   │   │   ├── 2020.csv
+│   │   │   ├── 2021.csv
+│   │   │   ├── 2022.csv
 │   ├── docs/
+│   ├── models/
 │   ├── pyproject.toml
 │   ├── requirements-dev.txt
 │   ├── requirements.txt
 │   ├── scripts/
 │   │   ├── setup_dev_tools.sh
+│   ├── setup.py
 │   ├── src/
 │   │   ├── app/
 │   │   │   ├── main.py
 │   │   ├── data_collection/
+│   │   │   ├── collect_odds_data.py
 │   │   │   ├── collect_race_data.py
+│   │   │   ├── load_race_data.py
 │   │   ├── prediction/
+│   │   │   ├── evaluate_model.py
 │   │   │   ├── model.py
+│   │   │   ├── simple_model.py
 │   │   ├── utils/
 │   │   │   ├── logger.py
 │   │   │   ├── test_file.py
 │   │   │   ├── update_readme.py
 │   ├── test.txt
 │   ├── tests/
+│   │   ├── test_compatibility.py
+│   │   ├── test_simple_model.py
 │   │   ├── test_utils.py
 ```
 

@@ -1,42 +1,28 @@
 ---
-description:
-globs:
+description: 
+globs: 
 alwaysApply: false
 ---
-# プロジェクト構造
+# KeibaAI プロジェクト構造ガイド
 
-このプロジェクトは以下の構造に従って開発を行います。
+## プロジェクトの概要
+KeibaAIは競馬予測AIシステムです。データ収集、分析、予測、Webインターフェースの提供を行います。
 
 ## ディレクトリ構造
+- `src/`: メインのソースコード
+  - `app/`: Webアプリケーション [main.py](mdc:src/app/main.py)
+  - `data_collection/`: データ収集モジュール [collect_race_data.py](mdc:src/data_collection/collect_race_data.py)
+  - `prediction/`: 予測モジュール [model.py](mdc:src/prediction/model.py)
+  - `utils/`: ユーティリティ関数 [logger.py](mdc:src/utils/logger.py)
+- `tests/`: テストコード [test_utils.py](mdc:tests/test_utils.py)
 
-```
-KeibaAI/
-├── data/           # 学習データとモデルの保存ディレクトリ
-├── docs/           # プロジェクトドキュメント
-├── models/         # 予測モデルの実装
-├── preprocessing/  # データ前処理スクリプト
-├── scripts/        # ユーティリティスクリプト
-├── tests/          # テストコード
-└── utils/          # 共通ユーティリティ関数
-```
+## 主要コンポーネント
+1. データ収集: 競馬データの自動収集システム
+2. 予測モデル: 機械学習による競馬予測
+3. Webインターフェース: 予測結果の表示と分析
 
-## 主要なファイル
-
-- `requirements.txt`: 依存パッケージの定義
-- `README.md`: プロジェクト概要
-- `CODING_STANDARDS.md`: コーディング規約
-- `.env`: 環境変数（バージョン管理対象外）
-
-## ファイル命名規則
-
-1. **Pythonファイル**
-   - スネークケース: `data_loader.py`
-   - テストファイル: `test_*.py`
-
-2. **ドキュメント**
-   - マークダウン形式: `*.md`
-   - 大文字で開始: `README.md`
-
-3. **設定ファイル**
-   - 小文字: `requirements.txt`
-   - ドット付きファイル: `.env`
+## コーディング規約
+- Python 3.11以上を使用
+- 型ヒントを必須とする
+- テストカバレッジ80%以上を維持
+- ドキュメンテーション文字列は日本語で記述

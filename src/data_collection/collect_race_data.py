@@ -7,167 +7,118 @@
      netkeiba.comからレースデータを取得し、CSVファイルとして保存します
 """
 
+import logging
+import time
+from pathlib import Path
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
-from datetime import datetime, timedelta
-import time
-import os
-from pathlib import Path
-import sys
+import re
 
-# 親ディレクトリをパスに追加
-sys.path.append(str(Path(__file__).parent.parent))
-
-from utils.logger import logger
+logger = logging.getLogger(__name__)
 
 
 class RaceDataCollector:
-    """
-    クラス名: RaceDataCollector
-    説明: 競馬データを収集するためのクラス
-         netkeiba.comからレースデータを取得し、CSVファイルとして保存します
-
-    主な機能:
-    - get_race_data: 指定された日付のレースデータを取得
-    - collect_historical_data: 指定された期間のデータを一括で取得
-
-    属性:
-    - base_url: str - netkeiba.comのベースURL
-    - output_dir: Path - データの保存先ディレクトリ
-    """
+    """レースデータ収集クラス"""
 
     def __init__(self):
-        # ===========================================
-        # 初期化処理
-        # ===========================================
-        logger.info("RaceDataCollectorの初期化を開始します")
-        self.base_url = "https://db.netkeiba.com/"
-        self.output_dir = Path("data/raw")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"データ保存先: {self.output_dir}")
+        """初期化"""
+        self.base_url = "https://db.netkeiba.com/race/"
+        self.data_dir = Path("data/race_results")
+        self.data_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_race_data(self, date):
+    def collect_race_data(self, year: int) -> None:
         """
-        メソッド名: get_race_data
-        説明: 指定された日付のレースデータを取得し、CSVファイルとして保存します
+        指定された年のレースデータを収集する
 
-        引数:
-        - date: str - 取得する日付（YYYYMMDD形式）
-
-        戻り値:
-        - None
-
-        例外:
-        - requests.exceptions.RequestException - ネットワークエラーが発生した場合
-        - Exception - その他の予期せぬエラーが発生した場合
+        Args:
+            year (int): 収集対象の年
         """
-        logger.info(f"日付 {date} のデータ取得を開始します")
-        url = f"{self.base_url}?pid=race_list&date={date}"
+        logger.info(f"{year}年のレースデータ収集を開始します")
 
+        race_results = []
+        # 競馬場コード（1: 札幌 〜 10: 小倉）
+        for track_id in range(1, 11):
+            # 開催回（1〜6）
+            for kai in range(1, 7):
+                # 開催日（1〜12）
+                for day in range(1, 13):
+                    race_id_prefix = f"{year:04d}{track_id:02d}{kai:02d}{day:02d}"
+                    # レース番号（1〜12）
+                    for race_number in range(1, 13):
+                        race_id = f"{race_id_prefix}{race_number:02d}"
+                        try:
+                            race_data = self._scrape_race_data(race_id)
+                            if race_data:
+                                race_results.extend(race_data)
+                                time.sleep(1)  # サーバー負荷軽減のため
+                        except Exception as e:
+                            logger.error(
+                                f"レースID {race_id} の取得中にエラーが発生: {e}"
+                            )
+
+        if race_results:
+            df = pd.DataFrame(race_results)
+            output_file = self.data_dir / f"race_results_{year}.csv"
+            df.to_csv(output_file, index=False)
+            logger.info(f"{year}年のデータを保存しました: {len(df)}件")
+
+    def _scrape_race_data(self, race_id: str) -> list:
+        """
+        個別のレースデータをスクレイピングする
+
+        Args:
+            race_id (str): レースID
+
+        Returns:
+            list: レース結果のリスト
+        """
+        url = f"{self.base_url}{race_id}"
+        response = requests.get(url)
+
+        if response.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(response.content, "html.parser")
+        result_table = soup.find("table", class_="race_table_01")
+
+        if not result_table:
+            return []
+
+        results = []
+        rows = result_table.find_all("tr")[1:]  # ヘッダーを除外
+
+        for row in rows:
+            cols = row.find_all("td")
+            if len(cols) >= 12:
+                result = {
+                    "着順": self._parse_rank(cols[0].text.strip()),
+                    "枠番": int(cols[1].text.strip()),
+                    "馬番": int(cols[2].text.strip()),
+                    "オッズ": float(cols[12].text.strip()),
+                    "レースID": race_id,
+                }
+                results.append(result)
+
+        return results
+
+    def _parse_rank(self, rank_str: str) -> int:
+        """着順を数値に変換する"""
         try:
-            # ===========================================
-            # データ取得処理
-            # ===========================================
-            logger.debug(f"URLにアクセスします: {url}")
-            response = requests.get(url)
-            response.raise_for_status()
+            return int(rank_str)
+        except ValueError:
+            return 99  # 失格、取消等の場合
 
-            logger.debug("HTMLのパースを開始します")
-            soup = BeautifulSoup(response.content, "html.parser")
 
-            # TODO: データ抽出ロジックの実装
-            logger.warning("データ抽出ロジックが未実装です")
-            # 以下の情報を取得する必要があります：
-            # - レース情報（開催場所、距離、天候など）
-            # - 出走馬情報（馬名、騎手、斤量など）
-            # - レース結果（着順、タイムなど）
+def main():
+    """メイン処理"""
+    logging.basicConfig(level=logging.INFO)
+    collector = RaceDataCollector()
 
-            # データをDataFrameに変換
-            data = pd.DataFrame()  # 実際のデータ構造に合わせて変更
-
-            # ===========================================
-            # データ保存処理
-            # ===========================================
-            output_file = self.output_dir / f"race_data_{date}.csv"
-            logger.info(f"データを保存します: {output_file}")
-            data.to_csv(output_file, index=False)
-
-            logger.info(f"データの保存が完了しました: {output_file}")
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"ネットワークエラーが発生しました: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"予期せぬエラーが発生しました: {e}")
-            raise
-
-    def collect_historical_data(self, start_date, end_date):
-        """
-        メソッド名: collect_historical_data
-        説明: 指定された期間のデータを一括で取得します
-
-        引数:
-        - start_date: str - 開始日（YYYYMMDD形式）
-        - end_date: str - 終了日（YYYYMMDD形式）
-
-        戻り値:
-        - None
-
-        例外:
-        - ValueError - 日付の形式が不正な場合
-        """
-        logger.info(f"期間 {start_date} から {end_date} のデータ収集を開始します")
-
-        try:
-            # ===========================================
-            # 日付のバリデーション
-            # ===========================================
-            current_date = datetime.strptime(start_date, "%Y%m%d")
-            end_date = datetime.strptime(end_date, "%Y%m%d")
-
-            if current_date > end_date:
-                raise ValueError("開始日が終了日より後です")
-
-            # ===========================================
-            # データ収集ループ
-            # ===========================================
-            total_days = (end_date - current_date).days + 1
-            logger.info(f"合計 {total_days} 日分のデータを収集します")
-
-            for day in range(total_days):
-                date_str = current_date.strftime("%Y%m%d")
-                logger.info(f"進捗: {day + 1}/{total_days} 日目 ({date_str})")
-
-                try:
-                    self.get_race_data(date_str)
-                except Exception as e:
-                    logger.error(f"日付 {date_str} のデータ取得に失敗しました: {e}")
-                    logger.warning("次の日付に進みます")
-
-                current_date += timedelta(days=1)
-                time.sleep(1)  # サーバーへの負荷を考慮
-
-            logger.info("データ収集が完了しました")
-
-        except ValueError as e:
-            logger.error(f"日付の形式が不正です: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"予期せぬエラーが発生しました: {e}")
-            raise
+    # 2018年から2022年までのデータを収集
+    for year in range(2018, 2023):
+        collector.collect_race_data(year)
 
 
 if __name__ == "__main__":
-    # ===========================================
-    # テスト実行
-    # ===========================================
-    try:
-        logger.info("テスト実行を開始します")
-        collector = RaceDataCollector()
-        # テスト用に最近の日付を指定
-        collector.get_race_data("20240301")
-        logger.info("テスト実行が完了しました")
-    except Exception as e:
-        logger.critical(f"テスト実行中にエラーが発生しました: {e}")
-        sys.exit(1)
+    main()
