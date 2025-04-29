@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import re
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,16 @@ class RaceDataCollector:
 
         if race_results:
             df = pd.DataFrame(race_results)
+            # 出走日を日付型に変換
+            df["date"] = pd.to_datetime(df["date"])
+            # 馬IDごとに出走履歴を時系列でソート
+            df = df.sort_values(["horse_id", "date"])
+            # 前回出走日と間隔を計算
+            df["last_race_date"] = df.groupby("horse_id")["date"].shift(1)
+            df["days_since_last_race"] = (df["date"] - df["last_race_date"]).dt.days
+            # デビュー戦フラグを設定
+            df["is_debut"] = df["last_race_date"].isna().astype(int)
+
             output_file = self.data_dir / f"race_results_{year}.csv"
             df.to_csv(output_file, index=False)
             logger.info(f"{year}年のデータを保存しました: {len(df)}件")
@@ -88,6 +99,10 @@ class RaceDataCollector:
         results = []
         rows = result_table.find_all("tr")[1:]  # ヘッダーを除外
 
+        # レース日を取得
+        race_date = soup.find("div", class_="race_head_info").find("p").text.strip()
+        race_date = datetime.strptime(race_date, "%Y年%m月%d日")
+
         for row in rows:
             cols = row.find_all("td")
             if len(cols) >= 12:
@@ -97,6 +112,8 @@ class RaceDataCollector:
                     "馬番": int(cols[2].text.strip()),
                     "オッズ": float(cols[12].text.strip()),
                     "レースID": race_id,
+                    "date": race_date,
+                    "horse_id": self._extract_horse_id(cols[3].find("a")["href"]),
                 }
                 results.append(result)
 
@@ -108,6 +125,11 @@ class RaceDataCollector:
             return int(rank_str)
         except ValueError:
             return 99  # 失格、取消等の場合
+
+    def _extract_horse_id(self, horse_url: str) -> str:
+        """馬のURLから馬IDを抽出する"""
+        match = re.search(r"horse/(\d+)", horse_url)
+        return match.group(1) if match else None
 
 
 def main():
