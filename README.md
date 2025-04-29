@@ -99,6 +99,11 @@ flake8
 │   │   │   ├── 2021.csv
 │   │   │   ├── 2022.csv
 │   ├── docs/
+│   ├── model_features.md
+│   ├── model_history/
+│   │   ├── evaluation_20250429_184831.json
+│   │   ├── evaluation_20250429_190040.json
+│   │   ├── evaluation_20250429_190640.json
 │   ├── models/
 │   ├── pyproject.toml
 │   ├── requirements-dev.txt

@@ -14,6 +14,8 @@ from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_sc
 import matplotlib.pyplot as plt
 from sklearn.calibration import calibration_curve
 from sklearn.cluster import KMeans
+from datetime import datetime
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +387,296 @@ def prepare_features(data_df):
     )
 
 
+def generate_feature_documentation(model, feature_names: list) -> str:
+    """
+    特徴量の情報をマークダウン形式で生成する
+
+    Args:
+        model: 学習済みのモデル
+        feature_names: 特徴量名のリスト
+
+    Returns:
+        str: マークダウン形式のドキュメント
+    """
+    feature_importance = model.feature_importance()
+
+    doc = f"""
+# モデル評価レポート
+
+## 最終更新日時
+{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## 使用特徴量一覧
+
+### 基本特徴量
+- **オッズ関連**
+  - `log_odds`: オッズの対数変換値
+    - 変換方法: `np.log(data_df["オッズ"].values)`
+    - 重要度: {feature_importance[0]}
+
+- **斤量関連**
+  - `weight_scaled`: スケーリングされた斤量
+    - 変換方法: `(data_df["斤量"].values - 48) * 2`
+    - 重要度: {feature_importance[1]}
+
+### レース間隔関連特徴量
+- **interval_category**: レース間隔のカテゴリ分類
+  - カテゴリ:
+    1. `デビュー`: 初出走
+    2. `連闘`: 0-8日
+    3. `中1週`: 8-15日
+    4. `中2-4週`: 15-35日
+    5. `1-3ヶ月`: 35-91日
+    6. `3-6ヶ月`: 91-182日
+    7. `6ヶ月-1年`: 182-365日
+    8. `1年以上`: 365日超
+  - 重要度: {feature_importance[2]}
+
+- **is_debut**: デビュー戦フラグ
+  - 値: `0` または `1`
+  - 計算方法: `last_race_date.isna().astype(int)`
+  - 重要度: {feature_importance[3]}
+
+### 時系列関連
+- **days_since_last_race**: 前走からの経過日数
+  - 計算方法: `(df["日付"] - df["last_race_date"]).dt.days`
+  - 注意: デビュー戦の場合はNaN
+
+### 目的変数
+- **3着以内フラグ**
+  - 計算方法: `(着順 <= 3).astype(int)`
+  - 値: `0`（3着より下）または `1`（3着以内）
+
+## 特徴量の重要度ランキング
+"""
+    # 特徴量の重要度をソートして追加
+    importance_pairs = list(zip(feature_names, feature_importance))
+    importance_pairs.sort(key=lambda x: x[1], reverse=True)
+
+    for name, importance in importance_pairs:
+        doc += f"- {name}: {importance}\n"
+
+    return doc
+
+
+def save_evaluation_history(
+    metrics: dict, feature_importance: list, feature_names: list
+) -> None:
+    """
+    評価履歴を保存する
+
+    Args:
+        metrics: 評価指標の辞書
+        feature_importance: 特徴量の重要度のリスト
+        feature_names: 特徴量名のリスト
+    """
+    # 履歴ディレクトリの作成
+    history_dir = Path("model_history")
+    history_dir.mkdir(exist_ok=True)
+
+    # 現在の日時を取得
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 評価結果を辞書にまとめる
+    evaluation_data = {
+        "timestamp": timestamp,
+        "metrics": metrics,
+        "feature_importance": dict(zip(feature_names, feature_importance.tolist())),
+    }
+
+    # JSONファイルとして保存
+    history_file = history_dir / f"evaluation_{timestamp}.json"
+    with open(history_file, "w", encoding="utf-8") as f:
+        json.dump(evaluation_data, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"評価履歴を保存しました: {history_file}")
+
+
+def generate_history_summary() -> str:
+    """
+    評価履歴のサマリーを生成する
+
+    Returns:
+        str: マークダウン形式のサマリー
+    """
+    history_dir = Path("model_history")
+    if not history_dir.exists():
+        return "評価履歴がありません"
+
+    # 履歴ファイルの一覧を取得
+    history_files = sorted(history_dir.glob("evaluation_*.json"))
+    if not history_files:
+        return "評価履歴がありません"
+
+    # サマリーの生成
+    summary = "# モデル評価履歴\n\n"
+
+    # 各履歴ファイルからデータを読み込んでサマリーに追加
+    for file in history_files:
+        with open(file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        summary += f"## {data['timestamp']}\n\n"
+        summary += "### 評価指標\n"
+        for metric, value in data["metrics"].items():
+            summary += f"- {metric}: {value:.3f}\n"
+
+        summary += "\n### 特徴量の重要度\n"
+        for feature, importance in sorted(
+            data["feature_importance"].items(), key=lambda x: x[1], reverse=True
+        ):
+            summary += f"- {feature}: {importance}\n"
+
+        summary += "\n---\n\n"
+
+    return summary
+
+
+def update_model_documentation(model, feature_names: list, metrics: dict) -> None:
+    """
+    モデルのドキュメントを更新する
+
+    Args:
+        model: 学習済みのモデル
+        feature_names: 特徴量名のリスト
+        metrics: 評価指標の辞書
+    """
+    doc = generate_feature_documentation(model, feature_names)
+
+    # 評価指標の情報を追加
+    doc += "\n## モデル評価指標\n"
+
+    # 全体評価指標
+    doc += "\n### 全体評価指標\n"
+    for metric_name, value in metrics.items():
+        if not metric_name.endswith("_at_3"):
+            doc += f"- {metric_name}: {value:.3f}\n"
+
+    # レース単位評価指標
+    doc += "\n### レース単位評価指標\n"
+    doc += (
+        "- Precision@3: 各レースで上位3頭予測に含まれた実際の3着以内馬の割合（平均）\n"
+    )
+    doc += f"  - 値: {metrics.get('precision_at_3', 0):.3f}\n"
+    doc += "- Recall@3: 各レースで実際の3着以内馬のうち、上位3頭予測に含まれた割合（平均）\n"
+    doc += f"  - 値: {metrics.get('recall_at_3', 0):.3f}\n"
+    doc += "- Hit Rate@3: 上位3頭予測に1頭でも3着以内馬が含まれていたレースの割合\n"
+    doc += f"  - 値: {metrics.get('hit_rate_at_3', 0):.3f}\n"
+    doc += "- NDCG@3: 予測順位の質を評価する指標（1.0が最高値）\n"
+    doc += f"  - 値: {metrics.get('ndcg_at_3', 0):.3f}\n"
+    doc += "  - 説明: 上位3頭の予測順位が実際の3着以内馬の順位にどれだけ近いかを評価\n"
+    doc += "  - 計算方法: DCG（予測順位の利得）をIDCG（理想的な順位の利得）で正規化\n"
+
+    # 履歴サマリーを追加
+    doc += "\n## 評価履歴\n"
+    doc += generate_history_summary()
+
+    # ドキュメントの保存先を設定
+    docs_path = Path("model_features.md")
+
+    # ドキュメントを更新
+    with open(docs_path, "w", encoding="utf-8") as f:
+        f.write(doc)
+
+    logger.info(f"モデルのドキュメントを更新しました: {docs_path}")
+
+
+def calculate_ndcg(y_true: pd.Series, y_pred_proba: pd.Series, k: int = 3) -> float:
+    """
+    NDCG@kを計算する
+
+    Args:
+        y_true: 実際の3着以内フラグ
+        y_pred_proba: モデルの予測確率
+        k: 上位何頭を評価するか
+
+    Returns:
+        float: NDCG@kの値
+    """
+    # 予測確率で降順ソート
+    sorted_indices = np.argsort(y_pred_proba)[::-1]
+    sorted_true = y_true.iloc[sorted_indices]
+
+    # 理想的な順位（実際の3着以内馬が上位に来る順位）
+    ideal_indices = np.argsort(y_true)[::-1]
+    ideal_true = y_true.iloc[ideal_indices]
+
+    # DCGの計算
+    dcg = 0
+    for i in range(min(k, len(y_true))):
+        dcg += (2 ** sorted_true.iloc[i] - 1) / np.log2(i + 2)
+
+    # IDCGの計算
+    idcg = 0
+    for i in range(min(k, len(y_true))):
+        idcg += (2 ** ideal_true.iloc[i] - 1) / np.log2(i + 2)
+
+    # NDCGの計算（IDCGが0の場合は1を返す）
+    return dcg / idcg if idcg > 0 else 1.0
+
+
+def calculate_race_metrics(
+    y_true: pd.Series, y_pred_proba: pd.Series, race_ids: pd.Series, k: int = 3
+) -> dict:
+    """
+    レース単位の評価指標を計算する
+
+    Args:
+        y_true: 実際の3着以内フラグ
+        y_pred_proba: モデルの予測確率
+        race_ids: レースID
+        k: 上位何頭を評価するか
+
+    Returns:
+        dict: 評価指標の辞書
+    """
+    # レースごとにグループ化
+    race_groups = pd.DataFrame(
+        {"y_true": y_true, "y_pred_proba": y_pred_proba, "race_id": race_ids}
+    ).groupby("race_id")
+
+    # 各レースでの指標を計算
+    precision_at_k = []
+    recall_at_k = []
+    hit_rate_at_k = []
+    ndcg_at_k = []
+
+    for race_id, group in race_groups:
+        # 予測確率で降順ソート
+        sorted_group = group.sort_values("y_pred_proba", ascending=False)
+
+        # 上位k頭を取得
+        top_k = sorted_group.head(k)
+
+        # Precision@k: 上位k頭の中の実際の3着以内馬の割合
+        precision = top_k["y_true"].sum() / k
+        precision_at_k.append(precision)
+
+        # Recall@k: 実際の3着以内馬のうち、上位k頭に含まれる割合
+        actual_top3 = group["y_true"].sum()
+        if actual_top3 > 0:
+            recall = top_k["y_true"].sum() / actual_top3
+            recall_at_k.append(recall)
+
+        # Hit Rate@k: 上位k頭に1頭でも3着以内馬が含まれていたか
+        hit_rate = 1 if top_k["y_true"].sum() > 0 else 0
+        hit_rate_at_k.append(hit_rate)
+
+        # NDCG@kの計算
+        ndcg = calculate_ndcg(group["y_true"], group["y_pred_proba"], k)
+        ndcg_at_k.append(ndcg)
+
+    # 全レースでの平均を計算
+    metrics = {
+        "precision_at_3": np.mean(precision_at_k),
+        "recall_at_3": np.mean(recall_at_k),
+        "hit_rate_at_3": np.mean(hit_rate_at_k),
+        "ndcg_at_3": np.mean(ndcg_at_k),
+    }
+
+    return metrics
+
+
 def evaluate_model_with_real_data():
     """実データを使用してモデルを評価"""
     # データの読み込みと前処理
@@ -553,7 +845,29 @@ def evaluate_model_with_real_data():
                     f"間隔: {int(race['days_since_last_race']) if race['days_since_last_race'] >= 0 else 'デビュー'}"
                 )
 
-    return model  # 最適な閾値を設定したモデルを返す
+    # モデル評価後、以下のコードを追加
+    metrics = {
+        "accuracy": best_metrics["accuracy"],
+        "precision": best_metrics["precision"],
+        "recall": best_metrics["recall"],
+        "f1_score": best_f1,
+        "best_threshold": best_threshold,
+    }
+
+    # レース単位の評価指標を計算
+    y_pred_proba = model.predict(X_test)
+    race_metrics = calculate_race_metrics(y_test, y_pred_proba, test_df["race_id"])
+    metrics.update(race_metrics)
+
+    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ"]
+
+    # 評価履歴の保存
+    save_evaluation_history(metrics, model.feature_importance(), feature_names)
+
+    # ドキュメントの更新
+    update_model_documentation(model, feature_names, metrics)
+
+    return model
 
 
 def main():
