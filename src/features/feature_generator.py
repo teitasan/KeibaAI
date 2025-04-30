@@ -194,54 +194,75 @@ class FeatureGenerator:
         # 「重」または「不良」を道悪として判定
         df["is_bad_track"] = df["馬場"].isin(["重", "不良"]).astype(int)
         
-        # 時系列順に各馬の道悪と全体の平均着順を計算（データリーケージ防止のため過去データのみ使用）
-        df["all_tracks_avg_rank"] = float('nan')  # 全馬場での平均着順
-        df["bad_tracks_avg_rank"] = float('nan')  # 道悪での平均着順
-        df["bad_tracks_count"] = 0  # 道悪での出走回数
-        df["diff_rank_bad_vs_overall"] = float('nan')  # 道悪と全体の平均着順の差
-        df["has_bad_track_exp"] = 0  # 道悪経験フラグ
+        # ベクトル化された方法で時系列特徴量を計算
+        # 1. 馬ごとに日付でソート
+        df = df.sort_values(["馬", "日付"])
         
-        # 馬ごとに処理
-        horse_groups = df.groupby("馬")
-        for horse, horse_df in horse_groups:
-            # 日付順にソート
-            horse_df = horse_df.sort_values("日付")
+        # 2. 各馬ごとの expanding window 統計量を計算 
+        # 注: shift(1)で"現在のレース"には"前回までの統計量"が反映される（時系列データリーケージの防止）
+        # 全馬場の平均着順
+        df["all_tracks_avg_rank"] = (
+            df.groupby("馬")["着順"]
+            .expanding()
+            .mean()
+            .groupby(level=0)
+            .shift(1)
+            .reset_index(level=0, drop=True)
+        )
+        
+        # 道悪馬場での累積出走回数
+        df["bad_tracks_count"] = (
+            df.groupby("馬")["is_bad_track"]
+            .expanding()
+            .sum()
+            .groupby(level=0)
+            .shift(1)
+            .reset_index(level=0, drop=True)
+            .fillna(0)
+        )
+        
+        # 道悪経験フラグ (2回以上の道悪経験がある場合に1)
+        df["has_bad_track_exp"] = (df["bad_tracks_count"] >= 2).astype(int)
+        
+        # 道悪での平均着順 (道悪データのみでexpanding計算)
+        # 注: 計算効率のため一時的なグループキーを作成
+        df["temp_key"] = df["馬"] + "_" + df["is_bad_track"].astype(str)
+        bad_track_df = df[df["is_bad_track"] == 1].copy()
+        
+        if not bad_track_df.empty:
+            bad_track_avg = (
+                bad_track_df.groupby("馬")["着順"]
+                .expanding()
+                .mean()
+                .groupby(level=0)
+                .shift(1)
+                .reset_index(level=0, drop=True)
+            )
             
-            # 各レースについて、そのレース時点での過去の成績から特徴量を計算
-            for i, (idx, row) in enumerate(horse_df.iterrows()):
-                if i == 0:  # 初出走の場合はスキップ
-                    continue
-                
-                # 現在のレースより前のレースデータを取得
-                past_races = horse_df.iloc[:i]
-                
-                # 全馬場での平均着順
-                all_tracks_avg = past_races["着順"].mean()
-                df.at[idx, "all_tracks_avg_rank"] = all_tracks_avg
-                
-                # 道悪での出走回数と平均着順
-                bad_track_races = past_races[past_races["is_bad_track"] == 1]
-                bad_track_count = len(bad_track_races)
-                df.at[idx, "bad_tracks_count"] = bad_track_count
-                
-                # 道悪経験判定（2回以上を経験ありとする）
-                df.at[idx, "has_bad_track_exp"] = 1 if bad_track_count >= 2 else 0
-                
-                # 道悪での平均着順（出走実績がある場合のみ）
-                if bad_track_count > 0:
-                    bad_tracks_avg = bad_track_races["着順"].mean()
-                    df.at[idx, "bad_tracks_avg_rank"] = bad_tracks_avg
-                    
-                    # 道悪と全体の平均着順の差（負の値=道悪得意、正の値=道悪苦手）
-                    df.at[idx, "diff_rank_bad_vs_overall"] = bad_tracks_avg - all_tracks_avg
+            # 結果を元のデータフレームにマージ
+            bad_track_df["bad_tracks_avg_rank"] = bad_track_avg
+            df = df.merge(
+                bad_track_df[["馬", "日付", "bad_tracks_avg_rank"]],
+                on=["馬", "日付"],
+                how="left"
+            )
+        else:
+            df["bad_tracks_avg_rank"] = np.nan
         
-        # NaN値の処理（平均値で埋める）
+        # 道悪と全体の平均着順の差（負の値=道悪得意、正の値=道悪苦手）
+        df["diff_rank_bad_vs_overall"] = df["bad_tracks_avg_rank"] - df["all_tracks_avg_rank"]
+        
+        # NANの処理
         df["all_tracks_avg_rank"] = df["all_tracks_avg_rank"].fillna(df["all_tracks_avg_rank"].mean())
         df["bad_tracks_avg_rank"] = df["bad_tracks_avg_rank"].fillna(df["all_tracks_avg_rank"])
         df["diff_rank_bad_vs_overall"] = df["diff_rank_bad_vs_overall"].fillna(0)  # 差がない場合は0
         
+        # 一時キーの削除
+        if "temp_key" in df.columns:
+            df = df.drop("temp_key", axis=1)
+        
         self.processed_df = df
-        logger.info("馬場関連特徴量の生成が完了しました")
+        logger.info("馬場適性特徴量の生成が完了しました")
         
         return self
     
