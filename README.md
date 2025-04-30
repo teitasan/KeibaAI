@@ -104,6 +104,10 @@ flake8
 │   │   ├── evaluation_20250429_184831.json
 │   │   ├── evaluation_20250429_190040.json
 │   │   ├── evaluation_20250429_190640.json
+│   │   ├── evaluation_20250430_183012.json
+│   │   ├── evaluation_20250430_185225.json
+│   │   ├── evaluation_20250430_193659.json
+│   │   ├── evaluation_20250430_200703.json
 │   ├── models/
 │   ├── pyproject.toml
 │   ├── requirements-dev.txt
@@ -118,6 +122,9 @@ flake8
 │   │   │   ├── collect_odds_data.py
 │   │   │   ├── collect_race_data.py
 │   │   │   ├── load_race_data.py
+│   │   ├── features/
+│   │   │   ├── __init__.py
+│   │   │   ├── feature_generator.py
 │   │   ├── prediction/
 │   │   │   ├── evaluate_model.py
 │   │   │   ├── model.py
@@ -140,12 +147,12 @@ flake8
 python src/data_collection/collect_race_data.py
 ```
 
-2. 予測の実行
+2. 予測モデルの評価と実行
 ```bash
-python src/prediction/predict.py
+python src/prediction/evaluate_model.py
 ```
 
 3. Webインターフェースの起動
 ```bash
 streamlit run src/app/main.py
-``` # KeibaAI
+```
