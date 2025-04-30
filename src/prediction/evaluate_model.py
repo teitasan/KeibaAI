@@ -63,8 +63,55 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     # デビュー戦フラグの作成
     df["is_debut"] = df["last_race_date"].isna().astype(int)
 
-    # レース間隔の欠損値はNaNのままにする（LightGBMが自動的に処理）
-    # df['days_since_last_race'] = df['days_since_last_race'].fillna(-1)
+    # 馬場状態を分析
+    # 「重」または「不良」を道悪として判定
+    df["is_bad_track"] = df["馬場"].isin(["重", "不良"]).astype(int)
+
+    # 時系列順に各馬の道悪と全体の平均着順を計算（データリーケージ防止のため過去データのみ使用）
+    df["all_tracks_avg_rank"] = float('nan')  # 全馬場での平均着順
+    df["bad_tracks_avg_rank"] = float('nan')  # 道悪での平均着順
+    df["bad_tracks_count"] = 0  # 道悪での出走回数
+    df["diff_rank_bad_vs_overall"] = float('nan')  # 道悪と全体の平均着順の差
+    df["has_bad_track_exp"] = 0  # 道悪経験フラグ
+
+    # 馬ごとに処理
+    horse_groups = df.groupby("馬")
+    for horse, horse_df in horse_groups:
+        # 日付順にソート
+        horse_df = horse_df.sort_values("日付")
+        
+        # 各レースについて、そのレース時点での過去の成績から特徴量を計算
+        for i, (idx, row) in enumerate(horse_df.iterrows()):
+            if i == 0:  # 初出走の場合はスキップ
+                continue
+
+            # 現在のレースより前のレースデータを取得
+            past_races = horse_df.iloc[:i]
+            
+            # 全馬場での平均着順
+            all_tracks_avg = past_races["着順"].mean()
+            df.at[idx, "all_tracks_avg_rank"] = all_tracks_avg
+            
+            # 道悪での出走回数と平均着順
+            bad_track_races = past_races[past_races["is_bad_track"] == 1]
+            bad_track_count = len(bad_track_races)
+            df.at[idx, "bad_tracks_count"] = bad_track_count
+            
+            # 道悪経験判定（2回以上を経験ありとする）
+            df.at[idx, "has_bad_track_exp"] = 1 if bad_track_count >= 2 else 0
+            
+            # 道悪での平均着順（出走実績がある場合のみ）
+            if bad_track_count > 0:
+                bad_tracks_avg = bad_track_races["着順"].mean()
+                df.at[idx, "bad_tracks_avg_rank"] = bad_tracks_avg
+                
+                # 道悪と全体の平均着順の差（負の値=道悪得意、正の値=道悪苦手）
+                df.at[idx, "diff_rank_bad_vs_overall"] = bad_tracks_avg - all_tracks_avg
+
+    # NaN値の処理（平均値で埋める）
+    df["all_tracks_avg_rank"] = df["all_tracks_avg_rank"].fillna(df["all_tracks_avg_rank"].mean())
+    df["bad_tracks_avg_rank"] = df["bad_tracks_avg_rank"].fillna(df["all_tracks_avg_rank"])
+    df["diff_rank_bad_vs_overall"] = df["diff_rank_bad_vs_overall"].fillna(0)  # 差がない場合は0
 
     return df
 
@@ -82,8 +129,9 @@ def plot_calibration_curve(model, X, y, save_path="calibration_curve.png"):
         matplotlib.rcParams["font.family"] = "Noto Sans CJK JP"
     matplotlib.rcParams["axes.unicode_minus"] = False
 
-    # 確率出力
-    prob_pos = model.predict(X)
+    # 確率出力（クラス1の予測確率）
+    prob_pos = model.predict(X)  # 修正前
+    prob_pos = model.predict_proba(X)[:, 1] if hasattr(model, 'predict_proba') else model.predict(X)  # 修正後: LightGBMの場合はpredict_probaがないので条件分岐
 
     # 区間ごとに分けて平均予測確率と実際の3着以内率を計算
     fraction_of_positives, mean_predicted_value = calibration_curve(
@@ -204,7 +252,7 @@ def analyze_odds_weight_cross(X_test, y_test, y_pred, odds_ranges, weight_ranges
             )
 
 
-def analyze_prediction_probability(model, X_test, y_test, prob_ranges):
+def analyze_prediction_probability(model, X_test, y_test, prob_ranges, threshold=0.5):
     """予測確率帯ごとの分析"""
     logger.info("\n=== 予測確率帯ごとの評価結果 ===")
     probs = model.predict(X_test)
@@ -215,7 +263,7 @@ def analyze_prediction_probability(model, X_test, y_test, prob_ranges):
             continue
 
         y_range = y_test[mask]
-        y_pred_range = (probs[mask] >= 0.5).astype(int)  # 0.5を基準とした予測
+        y_pred_range = (probs[mask] >= threshold).astype(int)  # 閾値をパラメータ化
 
         metrics = {
             "accuracy": (y_range == y_pred_range).mean(),
@@ -376,12 +424,55 @@ def prepare_features(data_df):
             f"\n  3着以内率: {top3_rate:.3f}"
         )
 
+    # 道悪適性の統計情報を表示
+    logger.info("\n=== 道悪適性の統計 ===")
+    # 道悪経験あり馬のみ
+    exp_horses = data_df[data_df["has_bad_track_exp"] == 1]
+    
+    # 得意・苦手・どちらでもないのグループ分け
+    good_at_bad = exp_horses[exp_horses["diff_rank_bad_vs_overall"] < -1]  # 道悪で1着以上良い
+    bad_at_bad = exp_horses[exp_horses["diff_rank_bad_vs_overall"] > 1]    # 道悪で1着以上悪い
+    neutral = exp_horses[
+        (exp_horses["diff_rank_bad_vs_overall"] >= -1) & 
+        (exp_horses["diff_rank_bad_vs_overall"] <= 1)
+    ]
+    
+    # 各グループの成績表示
+    logger.info(f"道悪得意馬: {len(good_at_bad)}頭 ({len(good_at_bad) / len(exp_horses) * 100:.1f}%)")
+    logger.info(f"道悪苦手馬: {len(bad_at_bad)}頭 ({len(bad_at_bad) / len(exp_horses) * 100:.1f}%)")
+    logger.info(f"中立的な馬: {len(neutral)}頭 ({len(neutral) / len(exp_horses) * 100:.1f}%)")
+    
+    # 道悪得意馬の3着以内率
+    good_at_bad_top3_rate = (good_at_bad["着順"] <= 3).mean()
+    logger.info(f"道悪得意馬の3着以内率: {good_at_bad_top3_rate:.3f}")
+    
+    # 道悪苦手馬の3着以内率
+    bad_at_bad_top3_rate = (bad_at_bad["着順"] <= 3).mean()
+    logger.info(f"道悪苦手馬の3着以内率: {bad_at_bad_top3_rate:.3f}")
+    
+    # 馬場状態の統計情報を表示
+    logger.info("\n=== 馬場状態別の3着以内率 ===")
+    for track_condition in data_df["馬場"].unique():
+        mask = data_df["馬場"] == track_condition
+        condition_df = data_df[mask]
+        top3_rate = (condition_df["着順"] <= 3).mean()
+        sample_size = len(condition_df)
+        
+        logger.info(
+            f"\n馬場状態 {track_condition}:"
+            f"\n  サンプル数: {sample_size}"
+            f"\n  3着以内率: {top3_rate:.3f}"
+        )
+
     return pd.DataFrame(
         {
             "log_odds": np.log(data_df["オッズ"].values),
             "weight_scaled": (data_df["斤量"].values - 48) * 2,
             "interval_category": data_df["interval_category"].values,
             "is_debut": data_df["is_debut"].values,
+            "diff_rank_bad_vs_overall": data_df["diff_rank_bad_vs_overall"].values,
+            "has_bad_track_exp": data_df["has_bad_track_exp"].values,
+            "track_condition": data_df["馬場"].astype('category').values,  # 馬場状態をカテゴリ型に変換
         },
         index=data_df.index,
     )
@@ -436,6 +527,22 @@ def generate_feature_documentation(model, feature_names: list) -> str:
   - 値: `0` または `1`
   - 計算方法: `last_race_date.isna().astype(int)`
   - 重要度: {feature_importance[3]}
+
+### 馬場適性関連特徴量
+- **diff_rank_bad_vs_overall**: 道悪（重・不良）と全体での平均着順の差
+  - 値: 数値（負の値=道悪得意、正の値=道悪苦手）
+  - 計算方法: `道悪での平均着順 - 全体での平均着順`
+  - 重要度: {feature_importance[4]}
+
+- **has_bad_track_exp**: 道悪経験フラグ
+  - 値: `0`（経験少）または `1`（2回以上の出走経験あり）
+  - 計算方法: `道悪での出走回数 >= 2`
+  - 重要度: {feature_importance[5]}
+
+- **track_condition**: 現在のレースの馬場状態
+  - 値: `良`、`稍`、`重`、`不`
+  - データソース: 元データの`馬場`カラム
+  - 重要度: {feature_importance[6]}
 
 ### 時系列関連
 - **days_since_last_race**: 前走からの経過日数
@@ -709,7 +816,7 @@ def evaluate_model_with_real_data():
     }
 
     # カテゴリ特徴量の指定
-    categorical_features = ["interval_category"]
+    categorical_features = ["interval_category", "track_condition"]
 
     # データセットの作成
     train_data = lgb.Dataset(
@@ -733,7 +840,7 @@ def evaluate_model_with_real_data():
 
     # 特徴量の重要度を表示
     feature_importance = model.feature_importance()
-    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ"]
+    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ", "道悪適性差", "道悪経験フラグ", "馬場状態"]
     logger.info("\n=== 特徴量の重要度 ===")
     for name, importance in zip(feature_names, feature_importance):
         logger.info(f"{name}: {importance}")
@@ -791,6 +898,11 @@ def evaluate_model_with_real_data():
     y_pred = pd.Series(
         (model.predict(X_test) >= best_threshold).astype(int), index=X_test.index
     )
+    
+    # 予測確率帯ごとの分析（最適な閾値を使用）
+    prob_ranges = [(0, 0.1), (0.1, 0.2), (0.2, 0.3), (0.3, 0.4), (0.4, 0.5), 
+                  (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.0)]
+    analyze_prediction_probability(model, X_test, y_test, prob_ranges, threshold=best_threshold)
 
     # レース間隔カテゴリ別の分析
     analyze_by_interval_category(X_test, y_test, y_pred)
@@ -859,7 +971,7 @@ def evaluate_model_with_real_data():
     race_metrics = calculate_race_metrics(y_test, y_pred_proba, test_df["race_id"])
     metrics.update(race_metrics)
 
-    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ"]
+    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ", "道悪適性差", "道悪経験フラグ", "馬場状態"]
 
     # 評価履歴の保存
     save_evaluation_history(metrics, model.feature_importance(), feature_names)
