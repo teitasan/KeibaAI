@@ -21,13 +21,43 @@ logger = logging.getLogger(__name__)
 
 
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
-    """レースデータの前処理"""
-    # 日付を日付型に変換
+    """
+    データの前処理を行う
+
+    Args:
+        df (pd.DataFrame): 元のデータフレーム
+
+    Returns:
+        pd.DataFrame: 前処理済みのデータフレーム
+    """
+    # カラム名を表示
+    logger.info(f"データフレームのカラム: {df.columns.tolist()}")
+
+    # 無効なデータを除外
+    df = df[df["オッズ"] != "---"]
+
+    # 特殊な着順（中止、除外など）を除外
+    df = df[df["着順"].str.isdigit()]
+
+    # データ型を変換
+    df["オッズ"] = df["オッズ"].astype(float)
+    df["着順"] = df["着順"].astype(int)
+
+    # 出走日を日付型に変換
+    df["日付"] = (
+        df["日付"]
+        .str.extract(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
+        .apply(lambda x: f"{x[0]}-{int(x[1]):02d}-{int(x[2]):02d}", axis=1)
+    )
     df["日付"] = pd.to_datetime(df["日付"])
 
-    # 馬ごとに前回の出走日を計算
-    df = df.sort_values(["馬", "日付"]).reset_index(drop=True)
+    # 全データを馬ごと、日付順にソート
+    df = df.sort_values(["馬", "日付", "race_id"], ascending=True)
+
+    # 前回出走日の計算
     df["last_race_date"] = df.groupby("馬")["日付"].shift(1)
+
+    # レース間隔の計算
     df["days_since_last_race"] = (df["日付"] - df["last_race_date"]).dt.days
 
     # デビュー戦フラグの作成
@@ -37,7 +67,7 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     # 「重」または「不良」を道悪として判定
     df["is_bad_track"] = df["馬場"].isin(["重", "不良"]).astype(int)
 
-    # ベクトル化された方法で時系列特徴量を計算
+    # ベクトル化された方法で道悪適性特徴量を計算
     # 全馬場の平均着順
     df["all_tracks_avg_rank"] = (
         df.groupby("馬")["着順"]
