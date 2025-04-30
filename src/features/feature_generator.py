@@ -266,6 +266,51 @@ class FeatureGenerator:
         
         return self
     
+    def generate_performance_features(self):
+        """
+        パフォーマンス関連の特徴量を生成
+        
+        以下の特徴量を生成します：
+        - 上がり3ハロン最速値
+        
+        Returns:
+            FeatureGenerator: self（メソッドチェーン用）
+        """
+        if self.processed_df is None:
+            raise ValueError("前処理が実行されていません。preprocess()を先に実行してください。")
+        
+        df = self.processed_df.copy()
+        
+        # 「上がり」を数値型に変換（無効値はNaNに）
+        df["上がり"] = pd.to_numeric(df["上がり"], errors="coerce")
+        
+        # 各馬の過去レースにおける上がり3ハロンの最速値（最小値）を計算
+        # データリーケージを防ぐためexpanding.min()とshift(1)を使用
+        df["best_final_3f"] = (
+            df.groupby("馬")["上がり"]
+            .expanding()
+            .min()  # 過去の上がりの最小値（最速）
+            .groupby(level=0)
+            .shift(1)  # 現在のレースより前の情報のみ使用
+            .reset_index(level=0, drop=True)
+        )
+        # best_final_3fはNaNのままにする（データがない馬はNaN値を維持）
+        
+        # 統計情報を出力
+        valid_best_final = df["best_final_3f"].dropna()
+        logger.info("\n=== 上がり3ハロン最速値の統計 ===")
+        logger.info(f"データあり: {len(valid_best_final)}頭 ({len(valid_best_final) / len(df) * 100:.1f}%)")
+        
+        if len(valid_best_final) > 0:
+            logger.info(f"最速値: {valid_best_final.min():.1f}秒")
+            logger.info(f"平均値: {valid_best_final.mean():.1f}秒")
+            logger.info(f"最遅値: {valid_best_final.max():.1f}秒")
+        
+        self.processed_df = df
+        logger.info("パフォーマンス特徴量の生成が完了しました")
+        
+        return self
+    
     def prepare_final_features(self):
         """
         最終的な特徴量を準備
@@ -289,6 +334,7 @@ class FeatureGenerator:
             "diff_rank_bad_vs_overall": data_df["diff_rank_bad_vs_overall"].values,
             "has_bad_track_exp": data_df["has_bad_track_exp"].values,
             "track_condition": data_df["馬場"].astype('category').values,
+            "best_final_3f": data_df["best_final_3f"].values,  # 上がり3ハロン最速値
         }
         
         # 設定に基づいて特徴量をフィルタリング
@@ -298,7 +344,8 @@ class FeatureGenerator:
                 'weight': ['weight_scaled'],
                 'interval': ['interval_category', 'is_debut'],
                 'track_condition': ['track_condition'],
-                'track_aptitude': ['diff_rank_bad_vs_overall', 'has_bad_track_exp']
+                'track_aptitude': ['diff_rank_bad_vs_overall', 'has_bad_track_exp'],
+                'performance': ['best_final_3f']  # 新しい特徴量グループを追加
             }
             
             selected_features = {}
@@ -369,6 +416,7 @@ class FeatureGenerator:
                 .preprocess()
                 .generate_time_features()
                 .generate_track_features()
+                .generate_performance_features()
                 .prepare_final_features()
                 .split_train_test())
     

@@ -43,6 +43,9 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df["オッズ"] = df["オッズ"].astype(float)
     df["着順"] = df["着順"].astype(int)
 
+    # 「上がり」を数値型に変換（無効値はNaNに）
+    df["上がり"] = pd.to_numeric(df["上がり"], errors="coerce")
+
     # 出走日を日付型に変換
     df["日付"] = (
         df["日付"]
@@ -118,10 +121,24 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     # 道悪と全体の平均着順の差（負の値=道悪得意、正の値=道悪苦手）
     df["diff_rank_bad_vs_overall"] = df["bad_tracks_avg_rank"] - df["all_tracks_avg_rank"]
     
+    # 各馬の過去レースにおける上がり3ハロンの最速値（最小値）を計算
+    # 各馬ごとに、そのレースまでの最速上がりタイムを特徴量として追加
+    # データリーケージを防ぐためexpanding.min()とshift(1)を使用
+    df["best_final_3f"] = (
+        df.groupby("馬")["上がり"]
+        .expanding()
+        .min()  # 過去の上がりの最小値（最速）
+        .groupby(level=0)
+        .shift(1)  # 現在のレースより前の情報のみ使用
+        .reset_index(level=0, drop=True)
+    )
+    # 注: この時点ではNaN値はそのままにしておく（データがない馬はNaNを維持）
+    
     # NaN値の処理（平均値で埋める）
     df["all_tracks_avg_rank"] = df["all_tracks_avg_rank"].fillna(df["all_tracks_avg_rank"].mean())
     df["bad_tracks_avg_rank"] = df["bad_tracks_avg_rank"].fillna(df["all_tracks_avg_rank"])
     df["diff_rank_bad_vs_overall"] = df["diff_rank_bad_vs_overall"].fillna(0)  # 差がない場合は0
+    # best_final_3fはNaNのままにする（要件に従って）
 
     return df
 
@@ -473,6 +490,29 @@ def prepare_features(data_df):
             f"\n  サンプル数: {sample_size}"
             f"\n  3着以内率: {top3_rate:.3f}"
         )
+        
+    # 上がり3ハロン最速値の統計情報を表示
+    logger.info("\n=== 上がり3ハロン最速値の統計 ===")
+    valid_best_final = data_df["best_final_3f"].dropna()
+    logger.info(f"データあり: {len(valid_best_final)}頭 ({len(valid_best_final) / len(data_df) * 100:.1f}%)")
+    logger.info(f"最速値: {valid_best_final.min():.1f}秒")
+    logger.info(f"平均値: {valid_best_final.mean():.1f}秒")
+    logger.info(f"最遅値: {valid_best_final.max():.1f}秒")
+    
+    # 上がり3ハロン最速値ごとの3着以内率
+    if len(valid_best_final) > 0:
+        bins = pd.qcut(valid_best_final, q=5, duplicates='drop')
+        for bin_range in bins.cat.categories:
+            mask = (data_df["best_final_3f"] >= bin_range.left) & (data_df["best_final_3f"] <= bin_range.right)
+            bin_df = data_df[mask]
+            top3_rate = (bin_df["着順"] <= 3).mean()
+            sample_size = len(bin_df)
+            
+            logger.info(
+                f"\n上がり3ハロン {bin_range.left:.1f}-{bin_range.right:.1f}秒:"
+                f"\n  サンプル数: {sample_size}"
+                f"\n  3着以内率: {top3_rate:.3f}"
+            )
 
     return pd.DataFrame(
         {
@@ -483,6 +523,7 @@ def prepare_features(data_df):
             "diff_rank_bad_vs_overall": data_df["diff_rank_bad_vs_overall"].values,
             "has_bad_track_exp": data_df["has_bad_track_exp"].values,
             "track_condition": data_df["馬場"].astype('category').values,  # 馬場状態をカテゴリ型に変換
+            "best_final_3f": data_df["best_final_3f"].values,  # 上がり3ハロン最速値（NaNのまま）
         },
         index=data_df.index,
     )
@@ -553,6 +594,13 @@ def generate_feature_documentation(model, feature_names: list) -> str:
   - 値: `良`、`稍`、`重`、`不`
   - データソース: 元データの`馬場`カラム
   - 重要度: {feature_importance[6]}
+
+### パフォーマンス関連特徴量
+- **best_final_3f**: 上がり3ハロン最速値
+  - 値: 秒数（小さいほど速い）
+  - 計算方法: 過去レースでの上がり3ハロンの最小値
+  - 特徴: データがない馬はNaN値
+  - 重要度: {feature_importance[7]}
 
 ### 時系列関連
 - **days_since_last_race**: 前走からの経過日数
@@ -850,7 +898,7 @@ def evaluate_model_with_real_data():
 
     # 特徴量の重要度を表示
     feature_importance = model.feature_importance()
-    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ", "道悪適性差", "道悪経験フラグ", "馬場状態"]
+    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ", "道悪適性差", "道悪経験フラグ", "馬場状態", "上がり3ハロン最速値"]
     logger.info("\n=== 特徴量の重要度 ===")
     for name, importance in zip(feature_names, feature_importance):
         logger.info(f"{name}: {importance}")
@@ -981,7 +1029,7 @@ def evaluate_model_with_real_data():
     race_metrics = calculate_race_metrics(y_test, y_pred_proba, test_df["race_id"])
     metrics.update(race_metrics)
 
-    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ", "道悪適性差", "道悪経験フラグ", "馬場状態"]
+    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ", "道悪適性差", "道悪経験フラグ", "馬場状態", "上がり3ハロン最速値"]
 
     # 評価履歴の保存
     save_evaluation_history(metrics, model.feature_importance(), feature_names)
