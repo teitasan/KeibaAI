@@ -1,158 +1,24 @@
-# KeibaAI - 競馬予想ソフト
+# KeibaAI_cat (CatBoost専用)
 
-競馬のレース結果を分析し、予測を行うAIシステムです。
+このプロジェクトは競馬予測AIのためのCatBoost専用リポジトリです。
 
-## 機能
+## 特徴
+- 機械学習モデルはCatBoostのみを使用
+- 依存関係もCatBoostに最適化
 
-- 過去のレースデータの収集
-- 馬・騎手の情報収集
-- 機械学習による予測
-- 予測結果の可視化
-
-## セットアップ手順
-
-### 1. 仮想環境の作成と有効化
-
+## セットアップ
 ```bash
-# 仮想環境の作成
-python -m venv venv
-
-# 仮想環境の有効化（macOS/Linux）
-source venv/bin/activate
-
-# 仮想環境の有効化（Windows）
-.\venv\Scripts\activate
-```
-
-### 2. 依存関係のインストール
-
-```bash
-# コア依存関係のインストール
 pip install -r requirements.txt
-
-# 開発用依存関係のインストール
-pip install -r requirements-dev.txt
 ```
 
-### 3. 環境変数の設定
+## 使い方
+- モデルの学習・推論は`src/prediction/model.py`や`src/prediction/catboost_model.py`を参照してください。
+- 評価スクリプトは`src/prediction/evaluate_model.py`です。
 
+## テスト
 ```bash
-# .envファイルの作成
-cp .env.example .env
-
-# .envファイルを編集して必要な環境変数を設定
+pytest
 ```
 
-## 開発ガイド
-
-### 依存関係の更新
-
-1. 仮想環境の有効化
-```bash
-source venv/bin/activate  # macOS/Linux
-.\venv\Scripts\activate   # Windows
-```
-
-2. 依存関係の更新
-```bash
-# 現在の依存関係を更新
-pip install --upgrade -r requirements.txt
-
-# 開発用依存関係を更新
-pip install --upgrade -r requirements-dev.txt
-
-# 依存関係のバージョンを固定
-pip freeze > requirements.txt
-```
-
-### コードスタイル
-
-- コードスタイルは`black`を使用して自動フォーマット
-- 型チェックは`mypy`を使用
-- リンターは`flake8`を使用
-
-```bash
-# コードの自動フォーマット
-black .
-
-# 型チェック
-mypy .
-
-# リンターの実行
-flake8
-```
-
-## プロジェクト構造
-
-```
-├── KeibaAI/
-│   ├── CODING_STANDARDS.md
-│   ├── README.md
-│   ├── calibration_curve.png
-│   ├── data/
-│   │   ├── processed/
-│   │   ├── race_results/
-│   │   ├── raw/
-│   │   │   ├── 2018.csv
-│   │   │   ├── 2019.csv
-│   │   │   ├── 2020.csv
-│   │   │   ├── 2021.csv
-│   │   │   ├── 2022.csv
-│   ├── docs/
-│   ├── model_features.md
-│   ├── model_history/
-│   │   ├── evaluation_20250429_184831.json
-│   │   ├── evaluation_20250429_190040.json
-│   │   ├── evaluation_20250429_190640.json
-│   │   ├── evaluation_20250430_183012.json
-│   │   ├── evaluation_20250430_185225.json
-│   │   ├── evaluation_20250430_193659.json
-│   │   ├── evaluation_20250430_200703.json
-│   ├── models/
-│   ├── pyproject.toml
-│   ├── requirements-dev.txt
-│   ├── requirements.txt
-│   ├── scripts/
-│   │   ├── setup_dev_tools.sh
-│   ├── setup.py
-│   ├── src/
-│   │   ├── app/
-│   │   │   ├── main.py
-│   │   ├── data_collection/
-│   │   │   ├── collect_odds_data.py
-│   │   │   ├── collect_race_data.py
-│   │   │   ├── load_race_data.py
-│   │   ├── features/
-│   │   │   ├── __init__.py
-│   │   │   ├── feature_generator.py
-│   │   ├── prediction/
-│   │   │   ├── evaluate_model.py
-│   │   │   ├── model.py
-│   │   │   ├── simple_model.py
-│   │   ├── utils/
-│   │   │   ├── logger.py
-│   │   │   ├── test_file.py
-│   │   │   ├── update_readme.py
-│   ├── test.txt
-│   ├── tests/
-│   │   ├── test_compatibility.py
-│   │   ├── test_simple_model.py
-│   │   ├── test_utils.py
-```
-
-## 使用方法
-
-1. データ収集
-```bash
-python src/data_collection/collect_race_data.py
-```
-
-2. 予測モデルの評価と実行
-```bash
-python src/prediction/evaluate_model.py
-```
-
-3. Webインターフェースの起動
-```bash
-streamlit run src/app/main.py
-```
+## 注意
+- LightGBMやscikit-learn等、CatBoost以外のMLライブラリはサポートしていません。

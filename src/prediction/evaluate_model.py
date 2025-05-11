@@ -1,5 +1,5 @@
 """
-実データを使用したモデル評価
+CatBoost専用モデル評価スクリプト
 3着以内に入るかどうかを予測
 """
 
@@ -7,1044 +7,330 @@ import logging
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-import lightgbm as lgb
-from src.data_collection.load_race_data import combine_race_data
-from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 import matplotlib.pyplot as plt
-from sklearn.calibration import calibration_curve
-from sklearn.cluster import KMeans
-from datetime import datetime
-import json
+from catboost import CatBoostClassifier
+from src.data_collection.load_race_data import combine_race_data
+from src.features.feature_generator import FeatureGenerator
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_curve
 
 logger = logging.getLogger(__name__)
 
 
-def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    データの前処理を行う
+def main():
+    logging.basicConfig(level=logging.INFO)
+    # 1. データ読み込み（例：2018-2022年）
+    logger.info("レースデータを読み込んでいます...")
+    df = combine_race_data(range(2018, 2023))
+    if df.empty:
+        print("データがありません")
+        return
+    logger.info(f"全データを結合しました。最終レコード数: {len(df)}")
 
-    Args:
-        df (pd.DataFrame): 元のデータフレーム
+    # 2. 特徴量生成
+    logger.info("特徴量生成を開始します...")
+    fg = FeatureGenerator(config={"start_year": 2018, "end_year": 2023})
+    fg.raw_df = df
+    fg.preprocess()
+    logger.info(f"前処理が完了しました: {len(fg.processed_df)}行")
+    fg.generate_time_features()
+    logger.info("時系列特徴量の生成が完了しました")
+    fg.generate_track_features()
+    logger.info("馬場適性特徴量の生成が完了しました")
+    fg.generate_performance_features()
+    logger.info("パフォーマンス特徴量の生成が完了しました")
+    # finalize_features_for_modelで全ての特徴量準備・型変換を完結
+    X_all, y_all, race_ids_all = fg.finalize_features_for_model()
 
-    Returns:
-        pd.DataFrame: 前処理済みのデータフレーム
-    """
-    # カラム名を表示
-    logger.info(f"データフレームのカラム: {df.columns.tolist()}")
+    # 学習・テスト分割（例：2021年までを学習、2022年をテスト）
+    logger.info("学習・テストデータの分割を開始します...")
+    train_idx = fg.processed_df["日付"].dt.year <= 2021
+    test_idx = fg.processed_df["日付"].dt.year == 2022
+    X_train, X_test = X_all[train_idx].copy(), X_all[test_idx].copy()
+    y_train, y_test = y_all[train_idx], y_all[test_idx]
+    race_ids_train, race_ids_test = None, None
+    if race_ids_all is not None:
+        race_ids_train, race_ids_test = race_ids_all[train_idx], race_ids_all[test_idx]
+    logger.info(f"学習データ数: {len(X_train)}, テストデータ数: {len(X_test)}")
 
-    # 無効なデータを除外
-    df = df[df["オッズ"] != "---"]
+    # モデル訓練前にrace_idや馬名を含むX_test_with_infoを保存
+    X_test_with_info = X_test.copy()  # drop前の情報を保持
+    print('X_test_with_info columns:', X_test_with_info.columns.tolist())
+    # --- ここで「馬番」を追加 ---
+    if '馬番' not in X_test_with_info.columns:
+        X_test_with_info['馬番'] = fg.processed_df.loc[X_test_with_info.index, '馬番'].values
+    X_train_model = X_train.drop(columns=["race_id", "馬"], errors="ignore")
+    X_test_model = X_test.drop(columns=["race_id", "馬"], errors="ignore")
 
-    # 特殊な着順（中止、除外など）を除外
-    df = df[df["着順"].str.isdigit()]
+    # --- TimeSeriesSplit用に学習データを日付順でソート ---
+    if '日付' in X_train.columns:
+        sort_idx = X_train['日付'].argsort()
+        X_train_model = X_train_model.iloc[sort_idx].reset_index(drop=True)
+        y_train = y_train.iloc[sort_idx].reset_index(drop=True)
 
-    # データ型を変換
-    df["オッズ"] = df["オッズ"].astype(float)
-    df["着順"] = df["着順"].astype(int)
-
-    # 「上がり」を数値型に変換（無効値はNaNに）
-    df["上がり"] = pd.to_numeric(df["上がり"], errors="coerce")
-
-    # 出走日を日付型に変換
-    df["日付"] = (
-        df["日付"]
-        .str.extract(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
-        .apply(lambda x: f"{x[0]}-{int(x[1]):02d}-{int(x[2]):02d}", axis=1)
+    # 5. CatBoostで学習・評価
+    logger.info("CatBoostモデルの学習を開始します...")
+    cat_features = [col for col in ['interval_category', '馬場', '騎手', 'has_bad_track_exp', 'クラス', '開催', '芝・ダート', '距離', '性別', '齢カテゴリ'] if col in X_train_model.columns]
+    base_model = CatBoostClassifier(
+        iterations=100,
+        random_seed=42,
+        verbose=0,
+        eval_metric='F1'
     )
-    df["日付"] = pd.to_datetime(df["日付"])
-
-    # 全データを馬ごと、日付順にソート
-    df = df.sort_values(["馬", "日付", "race_id"], ascending=True)
-
-    # 前回出走日の計算
-    df["last_race_date"] = df.groupby("馬")["日付"].shift(1)
-
-    # レース間隔の計算
-    df["days_since_last_race"] = (df["日付"] - df["last_race_date"]).dt.days
-
-    # デビュー戦フラグの作成
-    df["is_debut"] = df["last_race_date"].isna().astype(int)
-
-    # 馬場状態を分析
-    # 「重」または「不良」を道悪として判定
-    df["is_bad_track"] = df["馬場"].isin(["重", "不良"]).astype(int)
-
-    # ベクトル化された方法で道悪適性特徴量を計算
-    # 全馬場の平均着順
-    df["all_tracks_avg_rank"] = (
-        df.groupby("馬")["着順"]
-        .expanding()
-        .mean()
-        .groupby(level=0)
-        .shift(1)
-        .reset_index(level=0, drop=True)
+    # CalibratedClassifierCVでキャリブレーション（isotonic, sigmoid両方）
+    from sklearn.calibration import CalibratedClassifierCV
+    calibrated_model_iso = CalibratedClassifierCV(
+        estimator=base_model,
+        method='isotonic',
+        cv=3
     )
-    
-    # 道悪馬場での累積出走回数
-    df["bad_tracks_count"] = (
-        df.groupby("馬")["is_bad_track"]
-        .expanding()
-        .sum()
-        .groupby(level=0)
-        .shift(1)
-        .reset_index(level=0, drop=True)
-        .fillna(0)
+    calibrated_model_sig = CalibratedClassifierCV(
+        estimator=base_model,
+        method='sigmoid',
+        cv=3
     )
-    
-    # 道悪経験フラグ (2回以上の道悪経験がある場合に1)
-    df["has_bad_track_exp"] = (df["bad_tracks_count"] >= 2).astype(int)
-    
-    # 道悪での平均着順 (道悪データのみでexpanding計算)
-    bad_track_df = df[df["is_bad_track"] == 1].copy()
-    
-    if not bad_track_df.empty:
-        bad_track_avg = (
-            bad_track_df.groupby("馬")["着順"]
-            .expanding()
-            .mean()
-            .groupby(level=0)
-            .shift(1)
-            .reset_index(level=0, drop=True)
-        )
-        
-        # 結果を元のデータフレームにマージ
-        bad_track_df["bad_tracks_avg_rank"] = bad_track_avg
-        df = df.merge(
-            bad_track_df[["馬", "日付", "bad_tracks_avg_rank"]],
-            on=["馬", "日付"],
-            how="left"
-        )
-    else:
-        df["bad_tracks_avg_rank"] = np.nan
-    
-    # 道悪と全体の平均着順の差（負の値=道悪得意、正の値=道悪苦手）
-    df["diff_rank_bad_vs_overall"] = df["bad_tracks_avg_rank"] - df["all_tracks_avg_rank"]
-    
-    # 各馬の過去レースにおける上がり3ハロンの最速値（最小値）を計算
-    # 各馬ごとに、そのレースまでの最速上がりタイムを特徴量として追加
-    # データリーケージを防ぐためexpanding.min()とshift(1)を使用
-    df["best_final_3f"] = (
-        df.groupby("馬")["上がり"]
-        .expanding()
-        .min()  # 過去の上がりの最小値（最速）
-        .groupby(level=0)
-        .shift(1)  # 現在のレースより前の情報のみ使用
-        .reset_index(level=0, drop=True)
-    )
-    # 注: この時点ではNaN値はそのままにしておく（データがない馬はNaNを維持）
-    
-    # NaN値の処理（平均値で埋める）
-    df["all_tracks_avg_rank"] = df["all_tracks_avg_rank"].fillna(df["all_tracks_avg_rank"].mean())
-    df["bad_tracks_avg_rank"] = df["bad_tracks_avg_rank"].fillna(df["all_tracks_avg_rank"])
-    df["diff_rank_bad_vs_overall"] = df["diff_rank_bad_vs_overall"].fillna(0)  # 差がない場合は0
-    # best_final_3fはNaNのままにする（要件に従って）
-
-    return df
-
-
-def plot_calibration_curve(model, X, y, save_path="calibration_curve.png"):
-    """
-    モデルのキャリブレーションカーブを描画・保存
-    """
-    # 日本語フォント設定（AppleGothicがmacOS標準）
-    import matplotlib
-
-    try:
-        matplotlib.rcParams["font.family"] = "AppleGothic"
-    except:
-        matplotlib.rcParams["font.family"] = "Noto Sans CJK JP"
-    matplotlib.rcParams["axes.unicode_minus"] = False
-
-    # 確率出力（クラス1の予測確率）
-    prob_pos = model.predict(X)  # 修正前
-    prob_pos = model.predict_proba(X)[:, 1] if hasattr(model, 'predict_proba') else model.predict(X)  # 修正後: LightGBMの場合はpredict_probaがないので条件分岐
-
-    # 区間ごとに分けて平均予測確率と実際の3着以内率を計算
-    fraction_of_positives, mean_predicted_value = calibration_curve(
-        y, prob_pos, n_bins=10
-    )
-
-    # キャリブレーションカーブの数値をログに出力
-    logger.info("\n=== キャリブレーションカーブの数値 ===")
-    for i, (pred, actual) in enumerate(
-        zip(mean_predicted_value, fraction_of_positives)
-    ):
-        logger.info(
-            f"区間 {i+1}: 平均予測確率={pred:.3f}, 実際の3着以内率={actual:.3f}"
-        )
-
-    plt.figure(figsize=(6, 6))
-    plt.plot(mean_predicted_value, fraction_of_positives, "s-", label="モデル")
-    plt.plot([0, 1], [0, 1], "k--", label="理想")
-    plt.xlabel("モデルの平均予測確率")
-    plt.ylabel("実際の3着以内率")
-    plt.title("キャリブレーションカーブ")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-    logger.info(f"キャリブレーションカーブを {save_path} に保存しました。")
-
-
-def analyze_by_weight_range(X_test, y_test, y_pred, weight_ranges):
-    """斤量範囲ごとの分析"""
-    logger.info("\n=== 斤量別の評価結果 ===")
-    for start, end in weight_ranges:
-        # 元の斤量に戻す
-        weight_start = start / 2 + 48
-        weight_end = end / 2 + 48
-        mask = (X_test[:, 1] >= start) & (X_test[:, 1] < end)
-        if not mask.any():
-            continue
-
-        y_range = y_test[mask]
-        y_pred_range = y_pred[mask]
-
-        metrics = {
-            "accuracy": (y_range == y_pred_range).mean(),
-            "precision": (
-                precision_score(y_range, y_pred_range) if y_pred_range.sum() > 0 else 0
-            ),
-            "recall": recall_score(y_range, y_pred_range),
-            "f1": f1_score(y_range, y_pred_range) if y_pred_range.sum() > 0 else 0,
-            "n_samples": len(y_range),
-            "positive_rate": y_range.mean(),
-            "prediction_rate": y_pred_range.mean(),
-        }
-
-        logger.info(
-            f"\n斤量 {weight_start:.1f}-{weight_end:.1f}kg:"
-            f"\n  サンプル数: {metrics['n_samples']}"
-            f"\n  正解率: {metrics['accuracy']:.3f}"
-            f"\n  適合率: {metrics['precision']:.3f}"
-            f"\n  再現率: {metrics['recall']:.3f}"
-            f"\n  F1スコア: {metrics['f1']:.3f}"
-            f"\n  3着以内率: {metrics['positive_rate']:.3f}"
-            f"\n  予測率: {metrics['prediction_rate']:.3f}"
-        )
-
-
-def analyze_odds_weight_cross(X_test, y_test, y_pred, odds_ranges, weight_ranges):
-    """オッズと斤量のクロス分析"""
-    logger.info("\n=== オッズ×斤量のクロス分析 ===")
-    for o_start, o_end in odds_ranges:
-        for w_start, w_end in weight_ranges:
-            # 元の値に戻す
-            odds_start = np.exp(o_start)
-            odds_end = np.exp(o_end)
-            weight_start = w_start / 2 + 48
-            weight_end = w_end / 2 + 48
-
-            # オッズと斤量の両方の条件を満たすマスク
-            mask = (
-                (X_test[:, 0] >= o_start)
-                & (X_test[:, 0] < o_end)
-                & (X_test[:, 1] >= w_start)
-                & (X_test[:, 1] < w_end)
-            )
-            if not mask.any():
-                continue
-
-            y_range = y_test[mask]
-            y_pred_range = y_pred[mask]
-
-            if len(y_range) < 50:  # サンプル数が少なすぎる場合はスキップ
-                continue
-
-            metrics = {
-                "accuracy": (y_range == y_pred_range).mean(),
-                "precision": (
-                    precision_score(y_range, y_pred_range)
-                    if y_pred_range.sum() > 0
-                    else 0
-                ),
-                "recall": recall_score(y_range, y_pred_range),
-                "f1": f1_score(y_range, y_pred_range) if y_pred_range.sum() > 0 else 0,
-                "n_samples": len(y_range),
-                "positive_rate": y_range.mean(),
-                "prediction_rate": y_pred_range.mean(),
-            }
-
-            logger.info(
-                f"\nオッズ {odds_start:.1f}-{odds_end:.1f} × 斤量 {weight_start:.1f}-{weight_end:.1f}kg:"
-                f"\n  サンプル数: {metrics['n_samples']}"
-                f"\n  正解率: {metrics['accuracy']:.3f}"
-                f"\n  適合率: {metrics['precision']:.3f}"
-                f"\n  再現率: {metrics['recall']:.3f}"
-                f"\n  F1スコア: {metrics['f1']:.3f}"
-                f"\n  3着以内率: {metrics['positive_rate']:.3f}"
-                f"\n  予測率: {metrics['prediction_rate']:.3f}"
-            )
-
-
-def analyze_prediction_probability(model, X_test, y_test, prob_ranges, threshold=0.5):
-    """予測確率帯ごとの分析"""
-    logger.info("\n=== 予測確率帯ごとの評価結果 ===")
-    probs = model.predict(X_test)
-
-    for start, end in prob_ranges:
-        mask = (probs >= start) & (probs < end)
-        if not mask.any():
-            continue
-
-        y_range = y_test[mask]
-        y_pred_range = (probs[mask] >= threshold).astype(int)  # 閾値をパラメータ化
-
-        metrics = {
-            "accuracy": (y_range == y_pred_range).mean(),
-            "precision": (
-                precision_score(y_range, y_pred_range) if y_pred_range.sum() > 0 else 0
-            ),
-            "recall": recall_score(y_range, y_pred_range),
-            "f1": f1_score(y_range, y_pred_range) if y_pred_range.sum() > 0 else 0,
-            "n_samples": len(y_range),
-            "positive_rate": y_range.mean(),
-            "prediction_rate": y_pred_range.mean(),
-        }
-
-        logger.info(
-            f"\n予測確率 {start:.2f}-{end:.2f}:"
-            f"\n  サンプル数: {metrics['n_samples']}"
-            f"\n  正解率: {metrics['accuracy']:.3f}"
-            f"\n  適合率: {metrics['precision']:.3f}"
-            f"\n  再現率: {metrics['recall']:.3f}"
-            f"\n  F1スコア: {metrics['f1']:.3f}"
-            f"\n  3着以内率: {metrics['positive_rate']:.3f}"
-            f"\n  予測率: {metrics['prediction_rate']:.3f}"
-        )
-
-
-def analyze_interval_top3_rate(df: pd.DataFrame):
-    """レース間隔と3着以内率の関係を詳細に分析"""
-    logger.info("\n=== レース間隔と3着以内率の詳細分析 ===")
-
-    # デビュー戦を除外
-    non_debut_df = df[df["days_since_last_race"].notna()]
-
-    # 間隔を5日刻みでグループ化
-    interval_bins = np.arange(0, 365, 5)
-    interval_labels = [f"{i}-{i+5}" for i in interval_bins[:-1]]
-
-    # 各間隔帯の3着以内率を計算
-    non_debut_df["interval_bin"] = pd.cut(
-        non_debut_df["days_since_last_race"],
-        bins=interval_bins,
-        labels=interval_labels,
-        right=False,
-    )
-
-    interval_stats = (
-        non_debut_df.groupby("interval_bin")
-        .agg({"着順": lambda x: (x <= 3).mean(), "馬": "count"})
-        .rename(columns={"着順": "top3_rate", "馬": "count"})
-    )
-
-    # 結果を表示
-    for interval, stats in interval_stats.iterrows():
-        if stats["count"] >= 100:  # サンプル数が100以上の区間のみ表示
-            logger.info(
-                f"間隔 {interval}日:"
-                f"\n  サンプル数: {stats['count']}"
-                f"\n  3着以内率: {stats['top3_rate']:.3f}"
-            )
-
-    # 長期休養馬の分析
-    long_rest_bins = [0, 180, 365, 730, 10000]
-    long_rest_labels = ["0-180日", "180-365日", "365-730日", "730日以上"]
-
-    long_rest_df = df[df["days_since_last_race"].notna()].copy()
-    long_rest_df["rest_category"] = pd.cut(
-        long_rest_df["days_since_last_race"],
-        bins=long_rest_bins,
-        labels=long_rest_labels,
-        right=False,
-    )
-
-    long_rest_stats = (
-        long_rest_df.groupby("rest_category")
-        .agg({"着順": lambda x: (x <= 3).mean(), "馬": "count"})
-        .rename(columns={"着順": "top3_rate", "馬": "count"})
-    )
-
-    logger.info("\n=== 長期休養馬の分析 ===")
-    for category, stats in long_rest_stats.iterrows():
-        logger.info(
-            f"休養期間 {category}:"
-            f"\n  サンプル数: {stats['count']}"
-            f"\n  3着以内率: {stats['top3_rate']:.3f}"
-        )
-
-
-def analyze_by_interval_category(X_test, y_test, y_pred):
-    """レース間隔カテゴリ別の分析"""
-    logger.info("\n=== レース間隔カテゴリ別の分析 ===")
-
-    for category in X_test["interval_category"].unique():
-        mask = X_test["interval_category"] == category
-        if not mask.any():
-            continue
-
-        y_range = y_test[mask.index[mask]]
-        y_pred_range = y_pred[mask.index[mask]]
-
-        metrics = {
-            "accuracy": accuracy_score(y_range, y_pred_range),
-            "precision": (
-                precision_score(y_range, y_pred_range) if y_pred_range.sum() > 0 else 0
-            ),
-            "recall": recall_score(y_range, y_pred_range),
-            "f1": f1_score(y_range, y_pred_range) if y_pred_range.sum() > 0 else 0,
-            "n_samples": len(y_range),
-            "positive_rate": y_range.mean(),
-            "prediction_rate": y_pred_range.mean(),
-        }
-
-        logger.info(
-            f"\n間隔カテゴリ {category}:"
-            f"\n  サンプル数: {metrics['n_samples']}"
-            f"\n  正解率: {metrics['accuracy']:.3f}"
-            f"\n  適合率: {metrics['precision']:.3f}"
-            f"\n  再現率: {metrics['recall']:.3f}"
-            f"\n  F1スコア: {metrics['f1']:.3f}"
-            f"\n  3着以内率: {metrics['positive_rate']:.3f}"
-            f"\n  予測率: {metrics['prediction_rate']:.3f}"
-        )
-
-
-def prepare_features(data_df):
-    """特徴量の準備"""
-    # レース間隔のカテゴリ分け（ドメイン知識ベース）
-    data_df["interval_category"] = pd.cut(
-        data_df["days_since_last_race"],
-        bins=[-1, 0, 8, 15, 35, 91, 182, 365, float("inf")],
-        labels=[
-            "デビュー",
-            "連闘",
-            "中1週",
-            "中2-4週",
-            "1-3ヶ月",
-            "3-6ヶ月",
-            "6ヶ月-1年",
-            "1年以上",
-        ],
-        right=False,
-    )
-
-    # カテゴリの統計情報を表示
-    logger.info("\n=== ドメイン知識ベースのカテゴリ分けの統計 ===")
-    for category in data_df["interval_category"].unique():
-        if pd.isna(category):
-            continue
-        mask = data_df["interval_category"] == category
-        category_df = data_df[mask]
-        days_stats = category_df["days_since_last_race"].agg(["min", "max", "mean"])
-        top3_rate = (category_df["着順"] <= 3).mean()
-        sample_size = len(category_df)
-
-        logger.info(
-            f"\nカテゴリ {category}:"
-            f"\n  サンプル数: {sample_size}"
-            f"\n  間隔範囲: {days_stats['min']:.1f}-{days_stats['max']:.1f}日"
-            f"\n  平均間隔: {days_stats['mean']:.1f}日"
-            f"\n  3着以内率: {top3_rate:.3f}"
-        )
-
-    # 道悪適性の統計情報を表示
-    logger.info("\n=== 道悪適性の統計 ===")
-    # 道悪経験あり馬のみ
-    exp_horses = data_df[data_df["has_bad_track_exp"] == 1]
-    
-    # 得意・苦手・どちらでもないのグループ分け
-    good_at_bad = exp_horses[exp_horses["diff_rank_bad_vs_overall"] < -1]  # 道悪で1着以上良い
-    bad_at_bad = exp_horses[exp_horses["diff_rank_bad_vs_overall"] > 1]    # 道悪で1着以上悪い
-    neutral = exp_horses[
-        (exp_horses["diff_rank_bad_vs_overall"] >= -1) & 
-        (exp_horses["diff_rank_bad_vs_overall"] <= 1)
-    ]
-    
-    # 各グループの成績表示
-    logger.info(f"道悪得意馬: {len(good_at_bad)}頭 ({len(good_at_bad) / len(exp_horses) * 100:.1f}%)")
-    logger.info(f"道悪苦手馬: {len(bad_at_bad)}頭 ({len(bad_at_bad) / len(exp_horses) * 100:.1f}%)")
-    logger.info(f"中立的な馬: {len(neutral)}頭 ({len(neutral) / len(exp_horses) * 100:.1f}%)")
-    
-    # 道悪得意馬の3着以内率
-    good_at_bad_top3_rate = (good_at_bad["着順"] <= 3).mean()
-    logger.info(f"道悪得意馬の3着以内率: {good_at_bad_top3_rate:.3f}")
-    
-    # 道悪苦手馬の3着以内率
-    bad_at_bad_top3_rate = (bad_at_bad["着順"] <= 3).mean()
-    logger.info(f"道悪苦手馬の3着以内率: {bad_at_bad_top3_rate:.3f}")
-    
-    # 馬場状態の統計情報を表示
-    logger.info("\n=== 馬場状態別の3着以内率 ===")
-    for track_condition in data_df["馬場"].unique():
-        mask = data_df["馬場"] == track_condition
-        condition_df = data_df[mask]
-        top3_rate = (condition_df["着順"] <= 3).mean()
-        sample_size = len(condition_df)
-        
-        logger.info(
-            f"\n馬場状態 {track_condition}:"
-            f"\n  サンプル数: {sample_size}"
-            f"\n  3着以内率: {top3_rate:.3f}"
-        )
-        
-    # 上がり3ハロン最速値の統計情報を表示
-    logger.info("\n=== 上がり3ハロン最速値の統計 ===")
-    valid_best_final = data_df["best_final_3f"].dropna()
-    logger.info(f"データあり: {len(valid_best_final)}頭 ({len(valid_best_final) / len(data_df) * 100:.1f}%)")
-    logger.info(f"最速値: {valid_best_final.min():.1f}秒")
-    logger.info(f"平均値: {valid_best_final.mean():.1f}秒")
-    logger.info(f"最遅値: {valid_best_final.max():.1f}秒")
-    
-    # 上がり3ハロン最速値ごとの3着以内率
-    if len(valid_best_final) > 0:
-        bins = pd.qcut(valid_best_final, q=5, duplicates='drop')
-        for bin_range in bins.cat.categories:
-            mask = (data_df["best_final_3f"] >= bin_range.left) & (data_df["best_final_3f"] <= bin_range.right)
-            bin_df = data_df[mask]
-            top3_rate = (bin_df["着順"] <= 3).mean()
-            sample_size = len(bin_df)
-            
-            logger.info(
-                f"\n上がり3ハロン {bin_range.left:.1f}-{bin_range.right:.1f}秒:"
-                f"\n  サンプル数: {sample_size}"
-                f"\n  3着以内率: {top3_rate:.3f}"
-            )
-
-    return pd.DataFrame(
-        {
-            "log_odds": np.log(data_df["オッズ"].values),
-            "weight_scaled": (data_df["斤量"].values - 48) * 2,
-            "interval_category": data_df["interval_category"].values,
-            "is_debut": data_df["is_debut"].values,
-            "diff_rank_bad_vs_overall": data_df["diff_rank_bad_vs_overall"].values,
-            "has_bad_track_exp": data_df["has_bad_track_exp"].values,
-            "track_condition": data_df["馬場"].astype('category').values,  # 馬場状態をカテゴリ型に変換
-            "best_final_3f": data_df["best_final_3f"].values,  # 上がり3ハロン最速値（NaNのまま）
-        },
-        index=data_df.index,
-    )
-
-
-def generate_feature_documentation(model, feature_names: list) -> str:
-    """
-    特徴量の情報をマークダウン形式で生成する
-
-    Args:
-        model: 学習済みのモデル
-        feature_names: 特徴量名のリスト
-
-    Returns:
-        str: マークダウン形式のドキュメント
-    """
-    feature_importance = model.feature_importance()
-
-    doc = f"""
-# モデル評価レポート
-
-## 最終更新日時
-{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-## 使用特徴量一覧
-
-### 基本特徴量
-- **オッズ関連**
-  - `log_odds`: オッズの対数変換値
-    - 変換方法: `np.log(data_df["オッズ"].values)`
-    - 重要度: {feature_importance[0]}
-
-- **斤量関連**
-  - `weight_scaled`: スケーリングされた斤量
-    - 変換方法: `(data_df["斤量"].values - 48) * 2`
-    - 重要度: {feature_importance[1]}
-
-### レース間隔関連特徴量
-- **interval_category**: レース間隔のカテゴリ分類
-  - カテゴリ:
-    1. `デビュー`: 初出走
-    2. `連闘`: 0-8日
-    3. `中1週`: 8-15日
-    4. `中2-4週`: 15-35日
-    5. `1-3ヶ月`: 35-91日
-    6. `3-6ヶ月`: 91-182日
-    7. `6ヶ月-1年`: 182-365日
-    8. `1年以上`: 365日超
-  - 重要度: {feature_importance[2]}
-
-- **is_debut**: デビュー戦フラグ
-  - 値: `0` または `1`
-  - 計算方法: `last_race_date.isna().astype(int)`
-  - 重要度: {feature_importance[3]}
-
-### 馬場適性関連特徴量
-- **diff_rank_bad_vs_overall**: 道悪（重・不良）と全体での平均着順の差
-  - 値: 数値（負の値=道悪得意、正の値=道悪苦手）
-  - 計算方法: `道悪での平均着順 - 全体での平均着順`
-  - 重要度: {feature_importance[4]}
-
-- **has_bad_track_exp**: 道悪経験フラグ
-  - 値: `0`（経験少）または `1`（2回以上の出走経験あり）
-  - 計算方法: `道悪での出走回数 >= 2`
-  - 重要度: {feature_importance[5]}
-
-- **track_condition**: 現在のレースの馬場状態
-  - 値: `良`、`稍`、`重`、`不`
-  - データソース: 元データの`馬場`カラム
-  - 重要度: {feature_importance[6]}
-
-### パフォーマンス関連特徴量
-- **best_final_3f**: 上がり3ハロン最速値
-  - 値: 秒数（小さいほど速い）
-  - 計算方法: 過去レースでの上がり3ハロンの最小値
-  - 特徴: データがない馬はNaN値
-  - 重要度: {feature_importance[7]}
-
-### 時系列関連
-- **days_since_last_race**: 前走からの経過日数
-  - 計算方法: `(df["日付"] - df["last_race_date"]).dt.days`
-  - 注意: デビュー戦の場合はNaN
-
-### 目的変数
-- **3着以内フラグ**
-  - 計算方法: `(着順 <= 3).astype(int)`
-  - 値: `0`（3着より下）または `1`（3着以内）
-
-## 特徴量の重要度ランキング
-"""
-    # 特徴量の重要度をソートして追加
-    importance_pairs = list(zip(feature_names, feature_importance))
-    importance_pairs.sort(key=lambda x: x[1], reverse=True)
-
-    for name, importance in importance_pairs:
-        doc += f"- {name}: {importance}\n"
-
-    return doc
-
-
-def save_evaluation_history(
-    metrics: dict, feature_importance: list, feature_names: list
-) -> None:
-    """
-    評価履歴を保存する
-
-    Args:
-        metrics: 評価指標の辞書
-        feature_importance: 特徴量の重要度のリスト
-        feature_names: 特徴量名のリスト
-    """
-    # 履歴ディレクトリの作成
-    history_dir = Path("model_history")
-    history_dir.mkdir(exist_ok=True)
-
-    # 現在の日時を取得
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # 評価結果を辞書にまとめる
-    evaluation_data = {
-        "timestamp": timestamp,
-        "metrics": metrics,
-        "feature_importance": dict(zip(feature_names, feature_importance.tolist())),
-    }
-
-    # JSONファイルとして保存
-    history_file = history_dir / f"evaluation_{timestamp}.json"
-    with open(history_file, "w", encoding="utf-8") as f:
-        json.dump(evaluation_data, f, ensure_ascii=False, indent=2)
-
-    logger.info(f"評価履歴を保存しました: {history_file}")
-
-
-def generate_history_summary() -> str:
-    """
-    評価履歴のサマリーを生成する
-
-    Returns:
-        str: マークダウン形式のサマリー
-    """
-    history_dir = Path("model_history")
-    if not history_dir.exists():
-        return "評価履歴がありません"
-
-    # 履歴ファイルの一覧を取得
-    history_files = sorted(history_dir.glob("evaluation_*.json"))
-    if not history_files:
-        return "評価履歴がありません"
-
-    # サマリーの生成
-    summary = "# モデル評価履歴\n\n"
-
-    # 各履歴ファイルからデータを読み込んでサマリーに追加
-    for file in history_files:
-        with open(file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        summary += f"## {data['timestamp']}\n\n"
-        summary += "### 評価指標\n"
-        for metric, value in data["metrics"].items():
-            summary += f"- {metric}: {value:.3f}\n"
-
-        summary += "\n### 特徴量の重要度\n"
-        for feature, importance in sorted(
-            data["feature_importance"].items(), key=lambda x: x[1], reverse=True
-        ):
-            summary += f"- {feature}: {importance}\n"
-
-        summary += "\n---\n\n"
-
-    return summary
-
-
-def update_model_documentation(model, feature_names: list, metrics: dict) -> None:
-    """
-    モデルのドキュメントを更新する
-
-    Args:
-        model: 学習済みのモデル
-        feature_names: 特徴量名のリスト
-        metrics: 評価指標の辞書
-    """
-    doc = generate_feature_documentation(model, feature_names)
-
-    # 評価指標の情報を追加
-    doc += "\n## モデル評価指標\n"
+    # 学習
+    logger.info("CalibratedClassifierCV (isotonic) で学習中...")
+    calibrated_model_iso.fit(X_train_model, y_train, cat_features=cat_features)
+    logger.info("CalibratedClassifierCV (sigmoid) で学習中...")
+    calibrated_model_sig.fit(X_train_model, y_train, cat_features=cat_features)
+    # 予測確率
+    y_proba_iso = calibrated_model_iso.predict_proba(X_test_model)[:, 1]
+    y_proba_sig = calibrated_model_sig.predict_proba(X_test_model)[:, 1]
+
+    # best_thresholdをF1最大化で決定（isotonic, sigmoid両方）
+    from sklearn.metrics import precision_recall_curve, average_precision_score
+    def get_best_threshold_and_pred(y_true, y_proba):
+        f1_scores = []
+        precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
+        for p, r, t in zip(precisions, recalls, thresholds):
+            if p + r > 1e-8:
+                f1 = 2 * (p * r) / (p + r)
+            else:
+                f1 = 0
+            f1_scores.append(f1)
+        best_idx = int(np.argmax(f1_scores))
+        best_threshold = thresholds[best_idx]
+        y_pred = (y_proba >= best_threshold).astype(int)
+        return best_threshold, y_pred
+
+    best_threshold_iso, y_pred_iso = get_best_threshold_and_pred(y_test, y_proba_iso)
+    best_threshold_sig, y_pred_sig = get_best_threshold_and_pred(y_test, y_proba_sig)
 
     # 全体評価指標
-    doc += "\n### 全体評価指標\n"
-    for metric_name, value in metrics.items():
-        if not metric_name.endswith("_at_3"):
-            doc += f"- {metric_name}: {value:.3f}\n"
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+    def print_metrics(y_true, y_pred, best_threshold, label):
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        print(f"=== 全体評価指標 ({label}) ===")
+        print(f"accuracy: {accuracy:.4f}")
+        print(f"precision: {precision:.4f}")
+        print(f"recall: {recall:.4f}")
+        print(f"f1_score: {f1:.4f}")
+        print(f"best_threshold: {best_threshold:.4f}")
 
-    # レース単位評価指標
-    doc += "\n### レース単位評価指標\n"
-    doc += (
-        "- Precision@3: 各レースで上位3頭予測に含まれた実際の3着以内馬の割合（平均）\n"
-    )
-    doc += f"  - 値: {metrics.get('precision_at_3', 0):.3f}\n"
-    doc += "- Recall@3: 各レースで実際の3着以内馬のうち、上位3頭予測に含まれた割合（平均）\n"
-    doc += f"  - 値: {metrics.get('recall_at_3', 0):.3f}\n"
-    doc += "- Hit Rate@3: 上位3頭予測に1頭でも3着以内馬が含まれていたレースの割合\n"
-    doc += f"  - 値: {metrics.get('hit_rate_at_3', 0):.3f}\n"
-    doc += "- NDCG@3: 予測順位の質を評価する指標（1.0が最高値）\n"
-    doc += f"  - 値: {metrics.get('ndcg_at_3', 0):.3f}\n"
-    doc += "  - 説明: 上位3頭の予測順位が実際の3着以内馬の順位にどれだけ近いかを評価\n"
-    doc += "  - 計算方法: DCG（予測順位の利得）をIDCG（理想的な順位の利得）で正規化\n"
+    print_metrics(y_test, y_pred_iso, best_threshold_iso, 'isotonic')
+    print_metrics(y_test, y_pred_sig, best_threshold_sig, 'sigmoid')
 
-    # 履歴サマリーを追加
-    doc += "\n## 評価履歴\n"
-    doc += generate_history_summary()
+    # レース単位指標
+    def print_race_metrics(X_test, y_test, y_proba, race_ids_test, label):
+        if race_ids_test is not None:
+            race_ids_eval = race_ids_test.values
+        elif 'race_id' in X_test.index.names:
+            race_ids_eval = X_test.index.get_level_values('race_id')
+        elif 'race_id' in X_test.columns:
+            race_ids_eval = X_test['race_id']
+        else:
+            race_ids_eval = pd.Series([0]*len(X_test), index=X_test.index)
+        df_eval = X_test.copy()
+        df_eval['y_true'] = y_test.values
+        df_eval['y_proba'] = y_proba
+        df_eval['race_id'] = race_ids_eval
+        prec3s, rec3s, hit3s, ndcg3s = [], [], [], []
+        for _, group in df_eval.groupby('race_id'):
+            if len(group) < 3:
+                continue
+            top3 = group.sort_values('y_proba', ascending=False).head(3)
+            actual_top3_horses = group[group['y_true'] == 1]
+            n_actual_top3_in_race = actual_top3_horses['y_true'].sum()
+            n_pred_correct_in_top3 = top3['y_true'].sum()
+            prec3 = n_pred_correct_in_top3 / 3
+            rec3 = n_pred_correct_in_top3 / (n_actual_top3_in_race if n_actual_top3_in_race > 0 else 1)
+            hit3 = 1 if n_pred_correct_in_top3 > 0 else 0
+            dcg = ((top3['y_true'] / np.log2(np.arange(2, len(top3) + 2))).sum())
+            ideal_relevance_scores = np.sort(group['y_true'].values)[::-1][:len(top3)]
+            idcg = ((ideal_relevance_scores / np.log2(np.arange(2, len(ideal_relevance_scores) + 2))).sum())
+            ndcg = dcg / idcg if idcg > 0 else 0
+            prec3s.append(prec3)
+            rec3s.append(rec3)
+            hit3s.append(hit3)
+            ndcg3s.append(ndcg)
+        print(f"=== レース単位評価指標 ({label}) ===")
+        print(f"precision_at_3: {np.mean(prec3s):.4f}")
+        print(f"recall_at_3: {np.mean(rec3s):.4f}")
+        print(f"hit_rate_at_3: {np.mean(hit3s):.4f}")
+        print(f"ndcg_at_3: {np.mean(ndcg3s):.4f}")
 
-    # ドキュメントの保存先を設定
-    docs_path = Path("model_features.md")
+    print_race_metrics(X_test, y_test, y_proba_iso, race_ids_test, 'isotonic')
+    print_race_metrics(X_test, y_test, y_proba_sig, race_ids_test, 'sigmoid')
 
-    # ドキュメントを更新
-    with open(docs_path, "w", encoding="utf-8") as f:
-        f.write(doc)
+    # キャリブレーションカーブの比較
+    import matplotlib.pyplot as plt
+    from sklearn.calibration import calibration_curve
+    prob_true_iso, prob_pred_iso = calibration_curve(y_test, y_proba_iso, n_bins=10)
+    prob_true_sig, prob_pred_sig = calibration_curve(y_test, y_proba_sig, n_bins=10)
+    plt.figure(figsize=(6, 6))
+    plt.plot(prob_pred_iso, prob_true_iso, marker='o', label='isotonic')
+    plt.plot(prob_pred_sig, prob_true_sig, marker='o', label='sigmoid')
+    plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='理想的なキャリブレーション')
+    plt.xlabel('予測確率', fontsize=14)
+    plt.ylabel('実際の確率', fontsize=14)
+    plt.title('キャリブレーションカーブ比較', fontsize=16)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    plt.savefig('calibration_curve_compare.png')
+    plt.close()
+    print('キャリブレーションカーブ比較をcalibration_curve_compare.pngとして保存しました')
 
-    logger.info(f"モデルのドキュメントを更新しました: {docs_path}")
+    # --- 追加: キャリブレーション前のCatBoostモデルで特徴量重要度を出力 ---
+    logger.info("キャリブレーション前のCatBoostモデルを訓練データ全体でfitします...")
+    base_model.fit(X_train_model, y_train, cat_features=cat_features)
+    importances = base_model.get_feature_importance()
+    feature_names = base_model.feature_names_
+    print("=== キャリブレーション前モデルの特徴量重要度 ===")
+    feature_importance_df = pd.DataFrame({'feature': feature_names, 'importance': importances})
+    feature_importance_df = feature_importance_df.sort_values(by='importance', ascending=False)
+    for index, row in feature_importance_df.iterrows():
+        print(f"{row['feature']}: {row['importance']:.3f}")
 
+    # === ここからグラフ出力 ===
+    import matplotlib
+    import matplotlib.font_manager as fm
+    import platform
+    from pathlib import Path as _Path
+    font_candidates = [
+        "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
+        "/System/Library/Fonts/ヒラギノ角ゴ ProN W6.ttc",
+        "/Library/Fonts/IPAexGothic.ttf",
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc"
+    ]
+    font_path = None
+    for path in font_candidates:
+        if _Path(path).exists():
+            font_path = path
+            break
+    if font_path:
+        font_prop = fm.FontProperties(fname=font_path)
+        plt.rcParams['font.family'] = font_prop.get_name()
+        plt.rcParams['font.sans-serif'] = [font_prop.get_name()]
+        plt.rcParams['axes.unicode_minus'] = False
+        print(f'日本語フォントを適用: {font_prop.get_name()}')
+    else:
+        print('日本語フォントが見つかりませんでした。')
 
-def calculate_ndcg(y_true: pd.Series, y_pred_proba: pd.Series, k: int = 3) -> float:
-    """
-    NDCG@kを計算する
+    plt.figure(figsize=(10, 6))
+    plt.barh(feature_importance_df['feature'], feature_importance_df['importance'], color='skyblue')
+    plt.xlabel('重要度', fontsize=14)
+    plt.ylabel('特徴量', fontsize=14)
+    plt.title('特徴量の重要度', fontsize=16)
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.savefig('feature_importance.png')
+    plt.close()
+    print('特徴量重要度グラフをfeature_importance.pngとして保存しました')
 
-    Args:
-        y_true: 実際の3着以内フラグ
-        y_pred_proba: モデルの予測確率
-        k: 上位何頭を評価するか
+    from sklearn.calibration import calibration_curve
+    prob_true, prob_pred = calibration_curve(y_test, y_proba_iso, n_bins=10)
+    plt.figure(figsize=(6, 6))
+    plt.plot(prob_pred, prob_true, marker='o', label='isotonic')
+    plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='理想的なキャリブレーション')
+    plt.xlabel('予測確率', fontsize=14)
+    plt.ylabel('実際の確率', fontsize=14)
+    plt.title('キャリブレーションカーブ', fontsize=16)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    plt.savefig('calibration_curve_isotonic.png')
+    plt.close()
+    print('isotonicキャリブレーションカーブをcalibration_curve_isotonic.pngとして保存しました')
 
-    Returns:
-        float: NDCG@kの値
-    """
-    # 予測確率で降順ソート
-    sorted_indices = np.argsort(y_pred_proba)[::-1]
-    sorted_true = y_true.iloc[sorted_indices]
+    prob_true, prob_pred = calibration_curve(y_test, y_proba_sig, n_bins=10)
+    plt.figure(figsize=(6, 6))
+    plt.plot(prob_pred, prob_true, marker='o', label='sigmoid')
+    plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='理想的なキャリブレーション')
+    plt.xlabel('予測確率', fontsize=14)
+    plt.ylabel('実際の確率', fontsize=14)
+    plt.title('キャリブレーションカーブ', fontsize=16)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+    plt.savefig('calibration_curve_sigmoid.png')
+    plt.close()
+    print('sigmoidキャリブレーションカーブをcalibration_curve_sigmoid.pngとして保存しました')
 
-    # 理想的な順位（実際の3着以内馬が上位に来る順位）
-    ideal_indices = np.argsort(y_true)[::-1]
-    ideal_true = y_true.iloc[ideal_indices]
+    # --- 手動で最良パラメータを指定して再学習・評価のみ実行する分岐 ---
+    RUN_ONLY_BEST = True  # Trueならチューニングをスキップし、下記パラメータでのみ再学習・評価
+    manual_best_params = {'learning_rate': 0.1817321323824161, 'depth': 10, 'l2_leaf_reg': 8, 'iterations': 688}
 
-    # DCGの計算
-    dcg = 0
-    for i in range(min(k, len(y_true))):
-        dcg += (2 ** sorted_true.iloc[i] - 1) / np.log2(i + 2)
+    if RUN_ONLY_BEST:
+        print('手動指定の最良パラメータでモデルを再学習し、テストデータで評価します...')
+        best_params = manual_best_params.copy()
+        best_params.update({'random_seed': 42, 'eval_metric': 'F1', 'verbose': 0})
+        best_model = CatBoostClassifier(**best_params)
+        best_model.fit(X_train_model, y_train, cat_features=cat_features)
+        y_pred_best = best_model.predict(X_test_model)
+        y_proba_best = best_model.predict_proba(X_test_model)[:, 1]
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+        print('=== 手動最良パラメータモデルのテスト評価 ===')
+        print(f'accuracy: {accuracy_score(y_test, y_pred_best):.4f}')
+        print(f'precision: {precision_score(y_test, y_pred_best):.4f}')
+        print(f'recall: {recall_score(y_test, y_pred_best):.4f}')
+        print(f'f1_score: {f1_score(y_test, y_pred_best):.4f}')
+        print_race_metrics(X_test, y_test, y_proba_best, race_ids_test, 'Manual_best')
 
-    # IDCGの計算
-    idcg = 0
-    for i in range(min(k, len(y_true))):
-        idcg += (2 ** ideal_true.iloc[i] - 1) / np.log2(i + 2)
+        # --- F1最大化の閾値自動探索 ---
+        def get_best_threshold_and_pred(y_true, y_proba):
+            f1_scores = []
+            from sklearn.metrics import precision_recall_curve
+            precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
+            for p, r, t in zip(precisions, recalls, thresholds):
+                if p + r > 1e-8:
+                    f1 = 2 * (p * r) / (p + r)
+                else:
+                    f1 = 0
+                f1_scores.append(f1)
+            best_idx = int(np.argmax(f1_scores))
+            best_threshold = thresholds[best_idx]
+            y_pred = (y_proba >= best_threshold).astype(int)
+            return best_threshold, y_pred
 
-    # NDCGの計算（IDCGが0の場合は1を返す）
-    return dcg / idcg if idcg > 0 else 1.0
+        best_threshold, y_pred_best_f1 = get_best_threshold_and_pred(y_test, y_proba_best)
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+        print('--- F1最大化閾値での評価 ---')
+        print(f'best_threshold: {best_threshold:.4f}')
+        print(f'accuracy: {accuracy_score(y_test, y_pred_best_f1):.4f}')
+        print(f'precision: {precision_score(y_test, y_pred_best_f1):.4f}')
+        print(f'recall: {recall_score(y_test, y_pred_best_f1):.4f}')
+        print(f'f1_score: {f1_score(y_test, y_pred_best_f1):.4f}')
+        print_race_metrics(X_test, y_test, y_proba_best, race_ids_test, f'Manual_best@F1th={best_threshold:.3f}')
 
+        # --- X_test_with_infoに馬名をrace_idと馬番でjoin ---
+        # if '馬' not in X_test_with_info.columns:
+        #     key_cols = ['race_id', '馬番']
+        #     horse_map = fg.processed_df[key_cols + ['馬']].drop_duplicates().set_index(key_cols)['馬']
+        #     X_test_with_info['馬'] = X_test_with_info.set_index(key_cols).index.map(horse_map)
 
-def calculate_race_metrics(
-    y_true: pd.Series, y_pred_proba: pd.Series, race_ids: pd.Series, k: int = 3
-) -> dict:
-    """
-    レース単位の評価指標を計算する
+        # --- 予測確率が高い順に上位10頭を表示（X_test_with_infoを使う） ---
+        # print('\n--- 予測確率が高い上位10頭（参考値） ---')
+        # top10 = X_test_with_info.copy()
+        # top10['y_true'] = y_test.values
+        # top10['y_proba'] = y_proba_best
+        # if '馬' not in top10.columns:
+        #     top10['馬'] = '(不明)'
+        # display_cols = ['race_id', '馬', 'y_proba', 'y_true']
+        # top10 = top10.sort_values('y_proba', ascending=False).head(10)
+        # print(top10[display_cols].to_string(index=False))
 
-    Args:
-        y_true: 実際の3着以内フラグ
-        y_pred_proba: モデルの予測確率
-        race_ids: レースID
-        k: 上位何頭を評価するか
-
-    Returns:
-        dict: 評価指標の辞書
-    """
-    # レースごとにグループ化
-    race_groups = pd.DataFrame(
-        {"y_true": y_true, "y_pred_proba": y_pred_proba, "race_id": race_ids}
-    ).groupby("race_id")
-
-    # 各レースでの指標を計算
-    precision_at_k = []
-    recall_at_k = []
-    hit_rate_at_k = []
-    ndcg_at_k = []
-
-    for race_id, group in race_groups:
-        # 予測確率で降順ソート
-        sorted_group = group.sort_values("y_pred_proba", ascending=False)
-
-        # 上位k頭を取得
-        top_k = sorted_group.head(k)
-
-        # Precision@k: 上位k頭の中の実際の3着以内馬の割合
-        precision = top_k["y_true"].sum() / k
-        precision_at_k.append(precision)
-
-        # Recall@k: 実際の3着以内馬のうち、上位k頭に含まれる割合
-        actual_top3 = group["y_true"].sum()
-        if actual_top3 > 0:
-            recall = top_k["y_true"].sum() / actual_top3
-            recall_at_k.append(recall)
-
-        # Hit Rate@k: 上位k頭に1頭でも3着以内馬が含まれていたか
-        hit_rate = 1 if top_k["y_true"].sum() > 0 else 0
-        hit_rate_at_k.append(hit_rate)
-
-        # NDCG@kの計算
-        ndcg = calculate_ndcg(group["y_true"], group["y_pred_proba"], k)
-        ndcg_at_k.append(ndcg)
-
-    # 全レースでの平均を計算
-    metrics = {
-        "precision_at_3": np.mean(precision_at_k),
-        "recall_at_3": np.mean(recall_at_k),
-        "hit_rate_at_3": np.mean(hit_rate_at_k),
-        "ndcg_at_3": np.mean(ndcg_at_k),
-    }
-
-    return metrics
-
-
-def evaluate_model_with_real_data():
-    """実データを使用してモデルを評価"""
-    # データの読み込みと前処理
-    data_df = preprocess_data(combine_race_data(range(2018, 2023)))
-
-    # 訓練データとテストデータの分割
-    train_df = data_df[data_df["日付"].dt.year <= 2021].copy()
-    test_df = data_df[data_df["日付"].dt.year == 2022].copy()
-    logger.info(f"訓練データ: {len(train_df)}行, テストデータ: {len(test_df)}行")
-
-    # 特徴量の準備
-    X_train = prepare_features(train_df)
-    X_test = prepare_features(test_df)
-
-    # 目的変数の準備
-    y_train = pd.Series((train_df["着順"] <= 3).astype(int), index=train_df.index)
-    y_test = pd.Series((test_df["着順"] <= 3).astype(int), index=test_df.index)
-
-    # LightGBMのパラメータ設定
-    params = {
-        "objective": "binary",
-        "metric": "binary_logloss",
-        "boosting_type": "gbdt",
-        "num_leaves": 31,
-        "learning_rate": 0.05,
-        "feature_fraction": 0.9,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 5,
-        "verbose": -1,
-    }
-
-    # カテゴリ特徴量の指定
-    categorical_features = ["interval_category", "track_condition"]
-
-    # データセットの作成
-    train_data = lgb.Dataset(
-        X_train, label=y_train, categorical_feature=categorical_features
-    )
-    test_data = lgb.Dataset(
-        X_test,
-        label=y_test,
-        reference=train_data,
-        categorical_feature=categorical_features,
-    )
-
-    # モデルの学習
-    model = lgb.train(
-        params,
-        train_data,
-        valid_sets=[test_data],
-        num_boost_round=100,
-        callbacks=[lgb.early_stopping(stopping_rounds=10)],
-    )
-
-    # 特徴量の重要度を表示
-    feature_importance = model.feature_importance()
-    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ", "道悪適性差", "道悪経験フラグ", "馬場状態", "上がり3ハロン最速値"]
-    logger.info("\n=== 特徴量の重要度 ===")
-    for name, importance in zip(feature_names, feature_importance):
-        logger.info(f"{name}: {importance}")
-
-    # キャリブレーションカーブの作成
-    plot_calibration_curve(model, X_test, y_test)
-
-    # 閾値探索
-    logger.info("\n=== 閾値探索結果 ===")
-    thresholds = np.arange(0.1, 0.9, 0.05)
-    best_f1 = 0
-    best_threshold = 0.5
-    best_metrics = {}
-
-    for threshold in thresholds:
-        y_pred = pd.Series(
-            (model.predict(X_test) >= threshold).astype(int), index=X_test.index
-        )
-        f1 = f1_score(y_test, y_pred)
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred)
-        recall = recall_score(y_test, y_pred)
-        prediction_rate = y_pred.mean()
-
-        logger.info(
-            f"\n閾値 {threshold:.2f}:"
-            f"\n  F1スコア: {f1:.3f}"
-            f"\n  正解率: {accuracy:.3f}"
-            f"\n  適合率: {precision:.3f}"
-            f"\n  再現率: {recall:.3f}"
-            f"\n  予測率: {prediction_rate:.3f}"
-        )
-
-        if f1 > best_f1:
-            best_f1 = f1
-            best_threshold = threshold
-            best_metrics = {
-                "accuracy": accuracy,
-                "precision": precision,
-                "recall": recall,
-                "prediction_rate": prediction_rate,
-            }
-
-    logger.info(f"\n最適な閾値: {best_threshold:.2f} (F1スコア: {best_f1:.3f})")
-    logger.info(f"最適な閾値での性能:")
-    logger.info(f"  正解率: {best_metrics['accuracy']:.3f}")
-    logger.info(f"  適合率: {best_metrics['precision']:.3f}")
-    logger.info(f"  再現率: {best_metrics['recall']:.3f}")
-    logger.info(f"  予測率: {best_metrics['prediction_rate']:.3f}")
-
-    # 最適な閾値をモデルに保存
-    model.best_threshold = best_threshold
-
-    # 最適な閾値での詳細分析
-    y_pred = pd.Series(
-        (model.predict(X_test) >= best_threshold).astype(int), index=X_test.index
-    )
-    
-    # 予測確率帯ごとの分析（最適な閾値を使用）
-    prob_ranges = [(0, 0.1), (0.1, 0.2), (0.2, 0.3), (0.3, 0.4), (0.4, 0.5), 
-                  (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.0)]
-    analyze_prediction_probability(model, X_test, y_test, prob_ranges, threshold=best_threshold)
-
-    # レース間隔カテゴリ別の分析
-    analyze_by_interval_category(X_test, y_test, y_pred)
-
-    # デビュー戦と非デビュー戦の比較分析
-    logger.info("\n=== デビュー戦 vs 非デビュー戦の比較 ===")
-    for is_debut in [0, 1]:
-        mask = X_test["is_debut"] == is_debut
-        if not mask.any():
-            continue
-
-        y_range = y_test[mask.index[mask]]
-        y_pred_range = y_pred[mask.index[mask]]
-
-        metrics = {
-            "accuracy": accuracy_score(y_range, y_pred_range),
-            "precision": (
-                precision_score(y_range, y_pred_range) if y_pred_range.sum() > 0 else 0
-            ),
-            "recall": recall_score(y_range, y_pred_range),
-            "f1": f1_score(y_range, y_pred_range) if y_pred_range.sum() > 0 else 0,
-            "n_samples": len(y_range),
-            "positive_rate": y_range.mean(),
-            "prediction_rate": y_pred_range.mean(),
-        }
-
-        logger.info(
-            f"\n{'デビュー戦' if is_debut else '非デビュー戦'}:"
-            f"\n  サンプル数: {metrics['n_samples']}"
-            f"\n  正解率: {metrics['accuracy']:.3f}"
-            f"\n  適合率: {metrics['precision']:.3f}"
-            f"\n  再現率: {metrics['recall']:.3f}"
-            f"\n  F1スコア: {metrics['f1']:.3f}"
-            f"\n  3着以内率: {metrics['positive_rate']:.3f}"
-            f"\n  予測率: {metrics['prediction_rate']:.3f}"
-        )
-
-    # 検証用：2022年内で複数回出走している馬のレース間隔を確認
-    logger.info("\n=== 検証: 2022年の複数回出走馬のレース間隔 ===")
-    multiple_runners = test_df.groupby("馬").filter(lambda x: len(x) > 1)
-    if not multiple_runners.empty:
-        sample_horses = multiple_runners["馬"].unique()[
-            :3
-        ]  # 最大3頭をサンプルとして表示
-        for horse in sample_horses:
-            horse_races = test_df[test_df["馬"] == horse].sort_values("日付")
-            logger.info(f"\n馬: {horse}")
-            for _, race in horse_races.iterrows():
-                logger.info(
-                    f"  日付: {race['日付'].strftime('%Y-%m-%d')}, "
-                    f"前走: {race['last_race_date'].strftime('%Y-%m-%d') if pd.notna(race['last_race_date']) else 'なし'}, "
-                    f"間隔: {int(race['days_since_last_race']) if race['days_since_last_race'] >= 0 else 'デビュー'}"
-                )
-
-    # モデル評価後、以下のコードを追加
-    metrics = {
-        "accuracy": best_metrics["accuracy"],
-        "precision": best_metrics["precision"],
-        "recall": best_metrics["recall"],
-        "f1_score": best_f1,
-        "best_threshold": best_threshold,
-    }
-
-    # レース単位の評価指標を計算
-    y_pred_proba = model.predict(X_test)
-    race_metrics = calculate_race_metrics(y_test, y_pred_proba, test_df["race_id"])
-    metrics.update(race_metrics)
-
-    feature_names = ["log(オッズ)", "斤量", "interval_category", "デビュー戦フラグ", "道悪適性差", "道悪経験フラグ", "馬場状態", "上がり3ハロン最速値"]
-
-    # 評価履歴の保存
-    save_evaluation_history(metrics, model.feature_importance(), feature_names)
-
-    # ドキュメントの更新
-    update_model_documentation(model, feature_names, metrics)
-
-    return model
-
-
-def main():
-    """メイン処理"""
-    logging.basicConfig(level=logging.INFO)
-    evaluate_model_with_real_data()
-
+        return
 
 if __name__ == "__main__":
     main()

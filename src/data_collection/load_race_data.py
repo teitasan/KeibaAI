@@ -17,7 +17,7 @@ def load_race_data(year: int) -> pd.DataFrame:
         year (int): 読み込む年
 
     Returns:
-        pd.DataFrame: レースデータ
+        pd.DataFrame: レースデータ（障害レースは除外済み）
     """
     data_dir = Path("data/raw")
     file_path = data_dir / f"{year}.csv"
@@ -28,7 +28,13 @@ def load_race_data(year: int) -> pd.DataFrame:
 
     try:
         df = pd.read_csv(file_path, encoding="shift-jis")
-        logger.info(f"{year}年のレースデータを読み込みました。レコード数: {len(df)}")
+        # 障害レースを除外（「芝・ダート」列が「障」のデータ）
+        initial_len = len(df)
+        df = df[df['芝・ダート'] != '障']
+        filtered_len = len(df)
+        if initial_len > filtered_len:
+            logger.info(f"{year}年の障害レースを{initial_len - filtered_len}件除外しました。")
+        logger.info(f"{year}年のレースデータを読み込みました。レコード数: {filtered_len}")
         return df
     except Exception as e:
         logger.error(f"データ読み込み中にエラーが発生しました: {e}")

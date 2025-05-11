@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Union, Optional, Any
 
+print("LOADED FeatureGenerator from src/features/feature_generator.py")
+
 logger = logging.getLogger(__name__)
 
 
@@ -125,51 +127,81 @@ class FeatureGenerator:
         
         return self
     
+    # src/features/feature_generator.py 内の generate_time_features(self) メソッド
+
     def generate_time_features(self):
-        """
-        時系列関連の特徴量を生成
-        
-        以下の特徴量を生成します：
-        - 前走日
-        - レース間隔
-        - デビュー戦フラグ
-        - レース間隔カテゴリ
-        
-        Returns:
-            FeatureGenerator: self（メソッドチェーン用）
-        """
         if self.processed_df is None:
             raise ValueError("前処理が実行されていません。preprocess()を先に実行してください。")
+
+        # --- DEBUGGING: メソッド開始時の確認 ---
+        print("DEBUG: generate_time_features メソッド開始。")
+        print(f"DEBUG: generate_time_features 開始時のカラム: {self.processed_df.columns.tolist()}")
+        print(f"DEBUG: '馬名'カラムが存在するか: {'馬名' in self.processed_df.columns}")
+        print(f"DEBUG: '着順'カラムが存在するか: {'着順' in self.processed_df.columns}")
+        print(f"DEBUG: '着順'カラムの dtype: {self.processed_df['着順'].dtype}")
+        print(f"DEBUG: '着順'カラムのユニーク値 (最初の10個): {self.processed_df['着順'].value_counts(dropna=False).head(10)}")
+
+        # 馬・日付・race_idでソート（preprocessでソートされているはずですが、ここでも明示的に行うのは安全策）
+        self.processed_df = self.processed_df.sort_values(by=['馬', '日付', 'race_id'], ascending=True).copy()
+        print("DEBUG: generate_time_features 内でデータソート完了。")
+
+        # --- 'last_finish_order' と 'has_prev_race_data' の生成 ---
+        print("DEBUG: 前走着順/上がりタイム計算の直前。") 
+
+        # shifted_finish_order_series を計算し、reindexでインデックスを保証
+        shifted_finish_order_series = self.processed_df.groupby("馬")["着順"].shift(1).reindex(self.processed_df.index)
         
-        df = self.processed_df.copy()
+        # --- DEBUGGING: shifted_finish_order_series の中身を詳しく確認 ---
+        print(f"DEBUG: shifted_finish_order_series のshape: {shifted_finish_order_series.shape}")
+        print(f"DEBUG: shifted_finish_order_series のdtype: {shifted_finish_order_series.dtype}")
+        print(f"DEBUG: shifted_finish_order_series のhead():\n{shifted_finish_order_series.head()}")
+        print(f"DEBUG: shifted_finish_order_series のvalue_counts(dropna=False):\n{shifted_finish_order_series.value_counts(dropna=False)}")
+        print(f"DEBUG: shifted_finish_order_series にNaNが含まれるか: {shifted_finish_order_series.isna().any()}")
+
+        # self.processed_df への代入
+        self.processed_df["has_prev_race_data"] = shifted_finish_order_series.notna().astype(int)
+        self.processed_df["last_finish_order"] = shifted_finish_order_series
+
+        # --- DEBUGGING: 追加後のカラム確認 ---
+        print("DEBUG: last_finish_order と has_prev_race_data が追加されました。")
+        print(f"DEBUG: generate_time_features 中間時点のカラム: {self.processed_df.columns.tolist()}")
+
+        # --- 'last_agari_time' と 'no_last_agari_time' も同様に修正 ---
+        if '上がり' in self.processed_df.columns:
+            # '上がり'カラムが数値型であることを確認（必要に応じて変換）
+            if not pd.api.types.is_numeric_dtype(self.processed_df['上がり']):
+                print(f"DEBUG: '上がり'カラムのdtypeが数値ではありません: {self.processed_df['上がり'].dtype}. 変換を試みます。")
+                self.processed_df.loc[:, '上がり'] = pd.to_numeric(self.processed_df['上がり'], errors='coerce')
+                # NaNを埋めるのはここではしない。
+            shifted_agari_time_series = self.processed_df.groupby("馬")["上がり"].shift(1).reindex(self.processed_df.index)
+            self.processed_df["no_last_agari_time"] = shifted_agari_time_series.notna().astype(int)
+            self.processed_df["last_agari_time"] = shifted_agari_time_series
+            print("DEBUG: last_agari_time と no_last_agari_time が追加されました。")
+        else:
+            print("DEBUG: '上がり'カラムが見つかりません。last_agari_timeは生成されません。")
+
+
+        # --- 既存の時系列特徴量生成コード ---
+        # 'last_race_date' の計算
+        temp_last_race_date = self.processed_df.groupby("馬")["日付"].shift(1).reindex(self.processed_df.index)
+        self.processed_df["last_race_date"] = temp_last_race_date
         
-        # 前回出走日の計算
-        df["last_race_date"] = df.groupby("馬")["日付"].shift(1)
+        # 'days_since_last_race' の計算
+        # ★ここがエラーの原因だったはず：df["日付"] を self.processed_df["日付"] に修正 ★
+        self.processed_df["days_since_last_race"] = (self.processed_df["日付"] - self.processed_df["last_race_date"]).dt.days
         
-        # レース間隔の計算
-        df["days_since_last_race"] = (df["日付"] - df["last_race_date"]).dt.days
-        
-        # デビュー戦フラグの作成
-        df["is_debut"] = df["last_race_date"].isna().astype(int)
-        
-        # レース間隔のカテゴリ分け（ドメイン知識ベース）
-        df["interval_category"] = pd.cut(
-            df["days_since_last_race"],
+        # レース間隔のカテゴリ分け
+        self.processed_df["interval_category"] = pd.cut(
+            self.processed_df["days_since_last_race"],
             bins=[-1, 0, 8, 15, 35, 91, 182, 365, float("inf")],
-            labels=[
-                "デビュー",
-                "連闘",
-                "中1週",
-                "中2-4週",
-                "1-3ヶ月",
-                "3-6ヶ月",
-                "6ヶ月-1年",
-                "1年以上",
-            ],
+            labels=["デビュー", "連闘", "中1週", "中2-4週", "1-3ヶ月", "3-6ヶ月", "6ヶ月-1年", "1年以上",],
             right=False,
-        )
+        ).astype('category') # pd.cutの結果はCategoricalDtypeになるので、明示的なastype('category')は不要かも。
+
+        # デビュー戦フラグの作成
+        self.processed_df["is_debut"] = (self.processed_df["interval_category"] == "デビュー").astype(int)
         
-        self.processed_df = df
+        print("DEBUG: 時系列特徴量の生成が完了しましたメソッド終了直前。")
         logger.info("時系列特徴量の生成が完了しました")
         
         return self
@@ -188,31 +220,22 @@ class FeatureGenerator:
         """
         if self.processed_df is None:
             raise ValueError("前処理が実行されていません。preprocess()を先に実行してください。")
-        
-        df = self.processed_df.copy()
-        
-        # 「重」または「不良」を道悪として判定
-        df["is_bad_track"] = df["馬場"].isin(["重", "不良"]).astype(int)
-        
-        # ベクトル化された方法で時系列特徴量を計算
-        # 1. 馬ごとに日付でソート
-        df = df.sort_values(["馬", "日付"])
-        
-        # 2. 各馬ごとの expanding window 統計量を計算 
-        # 注: shift(1)で"現在のレース"には"前回までの統計量"が反映される（時系列データリーケージの防止）
+        # is_bad_trackをself.processed_dfに直接追加
+        self.processed_df["is_bad_track"] = self.processed_df["馬場"].isin(["重", "不良"]).astype(int)
+        # 馬ごとに日付でソート
+        self.processed_df = self.processed_df.sort_values(["馬", "日付"])
         # 全馬場の平均着順
-        df["all_tracks_avg_rank"] = (
-            df.groupby("馬")["着順"]
+        self.processed_df["all_tracks_avg_rank"] = (
+            self.processed_df.groupby("馬")["着順"]
             .expanding()
             .mean()
             .groupby(level=0)
             .shift(1)
             .reset_index(level=0, drop=True)
         )
-        
         # 道悪馬場での累積出走回数
-        df["bad_tracks_count"] = (
-            df.groupby("馬")["is_bad_track"]
+        self.processed_df["bad_tracks_count"] = (
+            self.processed_df.groupby("馬")["is_bad_track"]
             .expanding()
             .sum()
             .groupby(level=0)
@@ -220,50 +243,30 @@ class FeatureGenerator:
             .reset_index(level=0, drop=True)
             .fillna(0)
         )
-        
         # 道悪経験フラグ (2回以上の道悪経験がある場合に1)
-        df["has_bad_track_exp"] = (df["bad_tracks_count"] >= 2).astype(int)
-        
-        # 道悪での平均着順 (道悪データのみでexpanding計算)
-        # 注: 計算効率のため一時的なグループキーを作成
-        df["temp_key"] = df["馬"] + "_" + df["is_bad_track"].astype(str)
-        bad_track_df = df[df["is_bad_track"] == 1].copy()
-        
-        if not bad_track_df.empty:
-            bad_track_avg = (
-                bad_track_df.groupby("馬")["着順"]
-                .expanding()
-                .mean()
-                .groupby(level=0)
-                .shift(1)
-                .reset_index(level=0, drop=True)
-            )
-            
-            # 結果を元のデータフレームにマージ
-            bad_track_df["bad_tracks_avg_rank"] = bad_track_avg
-            df = df.merge(
-                bad_track_df[["馬", "日付", "bad_tracks_avg_rank"]],
-                on=["馬", "日付"],
-                how="left"
-            )
-        else:
-            df["bad_tracks_avg_rank"] = np.nan
-        
-        # 道悪と全体の平均着順の差（負の値=道悪得意、正の値=道悪苦手）
-        df["diff_rank_bad_vs_overall"] = df["bad_tracks_avg_rank"] - df["all_tracks_avg_rank"]
-        
+        self.processed_df["has_bad_track_exp"] = (self.processed_df["bad_tracks_count"] >= 2).astype(int)
+        # 道悪での平均着順 (過去の道悪レースのみでexpanding計算し、全レース行に持たせる)
+        self.processed_df["bad_tracks_avg_rank"] = (
+            self.processed_df[self.processed_df["is_bad_track"] == 1]
+            .groupby("馬")["着順"]
+            .expanding()
+            .mean()
+            .groupby(level=0)
+            .shift(1)
+            .reset_index(level=0, drop=True)
+        )
+        # 全レース行にmapで割り当てる（馬・日付で）
+        self.processed_df["bad_tracks_avg_rank"] = self.processed_df.set_index(["馬", "日付"]).index.map(
+            self.processed_df[self.processed_df["is_bad_track"] == 1].set_index(["馬", "日付"])["bad_tracks_avg_rank"]
+        )
+        # 道悪と全体の平均着順の差
+        self.processed_df["diff_rank_bad_vs_overall"] = self.processed_df["bad_tracks_avg_rank"] - self.processed_df["all_tracks_avg_rank"]
         # NANの処理
-        df["all_tracks_avg_rank"] = df["all_tracks_avg_rank"].fillna(df["all_tracks_avg_rank"].mean())
-        df["bad_tracks_avg_rank"] = df["bad_tracks_avg_rank"].fillna(df["all_tracks_avg_rank"])
-        df["diff_rank_bad_vs_overall"] = df["diff_rank_bad_vs_overall"].fillna(0)  # 差がない場合は0
-        
-        # 一時キーの削除
-        if "temp_key" in df.columns:
-            df = df.drop("temp_key", axis=1)
-        
-        self.processed_df = df
+        self.processed_df["all_tracks_avg_rank"] = self.processed_df["all_tracks_avg_rank"].fillna(self.processed_df["all_tracks_avg_rank"].mean())
+        self.processed_df["bad_tracks_avg_rank"] = self.processed_df["bad_tracks_avg_rank"].fillna(self.processed_df["all_tracks_avg_rank"])
+        self.processed_df["diff_rank_bad_vs_overall"] = self.processed_df["diff_rank_bad_vs_overall"].fillna(0)
         logger.info("馬場適性特徴量の生成が完了しました")
-        
+        print("[DEBUG] after generate_track_features:", self.processed_df.columns.tolist())
         return self
     
     def generate_performance_features(self):
@@ -282,22 +285,21 @@ class FeatureGenerator:
         df = self.processed_df.copy()
         
         # 「上がり」を数値型に変換（無効値はNaNに）
-        df["上がり"] = pd.to_numeric(df["上がり"], errors="coerce")
+        self.processed_df["上がり"] = pd.to_numeric(df["上がり"], errors="coerce")
         
         # 各馬の過去レースにおける上がり3ハロンの最速値（最小値）を計算
-        # データリーケージを防ぐためexpanding.min()とshift(1)を使用
-        df["best_final_3f"] = (
+        self.processed_df["best_final_3f"] = (
             df.groupby("馬")["上がり"]
             .expanding()
-            .min()  # 過去の上がりの最小値（最速）
+            .min()
             .groupby(level=0)
-            .shift(1)  # 現在のレースより前の情報のみ使用
+            .shift(1)
             .reset_index(level=0, drop=True)
         )
         # best_final_3fはNaNのままにする（データがない馬はNaN値を維持）
         
         # 統計情報を出力
-        valid_best_final = df["best_final_3f"].dropna()
+        valid_best_final = self.processed_df["best_final_3f"].dropna()
         logger.info("\n=== 上がり3ハロン最速値の統計 ===")
         logger.info(f"データあり: {len(valid_best_final)}頭 ({len(valid_best_final) / len(df) * 100:.1f}%)")
         
@@ -306,68 +308,47 @@ class FeatureGenerator:
             logger.info(f"平均値: {valid_best_final.mean():.1f}秒")
             logger.info(f"最遅値: {valid_best_final.max():.1f}秒")
         
-        self.processed_df = df
         logger.info("パフォーマンス特徴量の生成が完了しました")
-        
+        print("[DEBUG] after generate_performance_features:", self.processed_df.columns.tolist())
         return self
     
     def prepare_final_features(self):
         """
         最終的な特徴量を準備
         
-        モデルに入力する特徴量の変換・選択を行います。
-        
         Returns:
             FeatureGenerator: self（メソッドチェーン用）
         """
         if self.processed_df is None:
             raise ValueError("特徴量が生成されていません。generate_features()を先に実行してください。")
-        
         data_df = self.processed_df.copy()
-        
-        # 特徴量の準備
-        features = {
-            "log_odds": np.log(data_df["オッズ"].values),
-            "weight_scaled": (data_df["斤量"].values - 48) * 2,
-            "interval_category": data_df["interval_category"].values,
-            "is_debut": data_df["is_debut"].values,
-            "diff_rank_bad_vs_overall": data_df["diff_rank_bad_vs_overall"].values,
-            "has_bad_track_exp": data_df["has_bad_track_exp"].values,
-            "track_condition": data_df["馬場"].astype('category').values,
-            "best_final_3f": data_df["best_final_3f"].values,  # 上がり3ハロン最速値
-        }
-        
-        # 設定に基づいて特徴量をフィルタリング
-        if 'features' in self.config:
-            feature_mapping = {
-                'odds': ['log_odds'],
-                'weight': ['weight_scaled'],
-                'interval': ['interval_category', 'is_debut'],
-                'track_condition': ['track_condition'],
-                'track_aptitude': ['diff_rank_bad_vs_overall', 'has_bad_track_exp'],
-                'performance': ['best_final_3f']  # 新しい特徴量グループを追加
-            }
-            
-            selected_features = {}
-            for feature_group in self.config['features']:
-                if feature_group in feature_mapping:
-                    for feature in feature_mapping[feature_group]:
-                        if feature in features:
-                            selected_features[feature] = features[feature]
-            
-            features = selected_features if selected_features else features
-        
-        # 特徴量データフレームの作成
-        self.feature_df = pd.DataFrame(features, index=data_df.index)
-        
+        # evaluate_model.pyのuse_colsと一致させる
+        final_feature_names_for_model = [
+            '斤量',
+            'interval_category',
+            'diff_rank_bad_vs_overall',
+            'has_bad_track_exp',
+            '馬場',
+            'best_final_3f',
+            '騎手',
+            'クラス',
+            '開催',
+            '芝・ダート',
+            '距離',
+            '性別',
+            '齢カテゴリ',
+            'last_finish_order',
+            'has_prev_race_data'
+        ]
+        # 存在しないカラムは自動的に除外
+        available_features = [col for col in final_feature_names_for_model if col in data_df.columns]
+        self.feature_df = data_df[available_features].copy()
         # 目的変数の準備
         if self.config['target'] == 'top3':
             self.target = (data_df["着順"] <= 3).astype(int)
         else:
             self.target = (data_df["着順"] == 1).astype(int)  # 1着のみ
-        
         logger.info(f"最終特徴量の準備が完了しました: {self.feature_df.shape[1]}個の特徴量")
-        
         return self
     
     def split_train_test(self):
@@ -498,11 +479,6 @@ class FeatureGenerator:
     8. `1年以上`: 365日超
   - 重要度: {self.feature_importance.get('interval_category', 'N/A')}
 
-- **is_debut**: デビュー戦フラグ
-  - 値: `0` または `1`
-  - 計算方法: `last_race_date.isna().astype(int)`
-  - 重要度: {self.feature_importance.get('is_debut', 'N/A')}
-
 ### 馬場適性関連特徴量
 - **diff_rank_bad_vs_overall**: 道悪（重・不良）と全体での平均着順の差
   - 値: 数値（負の値=道悪得意、正の値=道悪苦手）
@@ -527,7 +503,57 @@ class FeatureGenerator:
             key=lambda x: x[1], 
             reverse=True
         )
-        
         for name, importance in sorted_importance:
             doc += f"- {name}: {importance}\n"
- 
+        
+        return doc
+
+    def finalize_features_for_model(self, use_cols=None):
+        """
+        モデル投入直前の特徴量選択・型変換・追加処理をまとめて行う
+        use_cols: 最終的にモデルに渡す特徴量名リスト（Noneならデフォルト）
+        戻り値: X（特徴量DataFrame）, y（目的変数Series）、race_id（Series, 存在すれば）
+        """
+        df = self.processed_df.copy()
+        # 性カラムを「性別」として追加
+        if '性' in df.columns:
+            df['性別'] = df['性']
+        # 齢カラムをカテゴリ分けして「齢カテゴリ」として追加
+        if '齢' in df.columns:
+            bins = [-float('inf'), 2, 3, 4, 5, 6, float('inf')]
+            labels = ['2以下', '3', '4', '5', '6', '7以上']
+            df['齢カテゴリ'] = pd.cut(df['齢'], bins=bins, labels=labels, right=True)
+            df['齢カテゴリ'] = df['齢カテゴリ'].astype('category')
+        # interval_category, 馬場, 騎手, has_bad_track_exp, クラス, 開催, 芝・ダート, 距離, 性別, 齢カテゴリ をカテゴリ型に
+        for col in ['interval_category', '馬場', '騎手', 'has_bad_track_exp', 'クラス', '開催', '芝・ダート', '距離', '性別', '齢カテゴリ']:
+            if col in df.columns:
+                df[col] = df[col].astype(str).fillna('NaN').astype('category')
+        # 最終的な特徴量リスト
+        if use_cols is None:
+            use_cols = [
+                '斤量',
+                'interval_category',
+                'diff_rank_bad_vs_overall',
+                'has_bad_track_exp',
+                '馬場',
+                'best_final_3f',
+                '騎手',
+                'クラス',
+                '開催',
+                '芝・ダート',
+                '距離',
+                '性別',
+                '齢カテゴリ',
+                'last_finish_order',
+                'has_prev_race_data'
+            ]
+        # race_idもあれば残す
+        use_cols_with_race_id = use_cols + [col for col in ['race_id'] if col in df.columns]
+        X = df[use_cols_with_race_id].copy()
+        # 目的変数
+        if self.config['target'] == 'top3':
+            y = (df['着順'] <= 3).astype(int)
+        else:
+            y = (df['着順'] == 1).astype(int)
+        race_id = df['race_id'] if 'race_id' in df.columns else None
+        return X, y, race_id
