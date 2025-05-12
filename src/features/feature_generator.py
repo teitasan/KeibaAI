@@ -201,6 +201,18 @@ class FeatureGenerator:
         # デビュー戦フラグの作成
         self.processed_df["is_debut"] = (self.processed_df["interval_category"] == "デビュー").astype(int)
         
+        # 前走クラス
+        if 'クラス' in self.processed_df.columns:
+            self.processed_df['last_class'] = self.processed_df.groupby('馬')['クラス'].shift(1)
+        
+        # 出走頭数
+        # race_idの型・桁数を明示的に統一（int型13桁に揃える）
+        if self.processed_df['race_id'].dtype != 'int64':
+            # まずstr型→int型へ変換（13桁保証）
+            self.processed_df['race_id'] = self.processed_df['race_id'].astype(str).str.zfill(13).astype('int64')
+        # 出走頭数をrace_idごとにカウント
+        self.processed_df['出走頭数'] = self.processed_df.groupby('race_id')['馬'].transform('size')
+        
         print("DEBUG: 時系列特徴量の生成が完了しましたメソッド終了直前。")
         logger.info("時系列特徴量の生成が完了しました")
         
@@ -338,7 +350,9 @@ class FeatureGenerator:
             '性別',
             '齢カテゴリ',
             'last_finish_order',
-            'has_prev_race_data'
+            'has_prev_race_data',
+            'last_class',
+            '出走頭数',
         ]
         # 存在しないカラムは自動的に除外
         available_features = [col for col in final_feature_names_for_model if col in data_df.columns]
@@ -524,8 +538,8 @@ class FeatureGenerator:
             labels = ['2以下', '3', '4', '5', '6', '7以上']
             df['齢カテゴリ'] = pd.cut(df['齢'], bins=bins, labels=labels, right=True)
             df['齢カテゴリ'] = df['齢カテゴリ'].astype('category')
-        # interval_category, 馬場, 騎手, has_bad_track_exp, クラス, 開催, 芝・ダート, 距離, 性別, 齢カテゴリ をカテゴリ型に
-        for col in ['interval_category', '馬場', '騎手', 'has_bad_track_exp', 'クラス', '開催', '芝・ダート', '距離', '性別', '齢カテゴリ']:
+        # interval_category, 馬場, 騎手, has_bad_track_exp, クラス, 開催, 芝・ダート, 距離, 性別, 齢カテゴリ, last_class をカテゴリ型に
+        for col in ['interval_category', '馬場', '騎手', 'has_bad_track_exp', 'クラス', '開催', '芝・ダート', '距離', '性別', '齢カテゴリ', 'last_class']:
             if col in df.columns:
                 df[col] = df[col].astype(str).fillna('NaN').astype('category')
         # 最終的な特徴量リスト
@@ -545,7 +559,9 @@ class FeatureGenerator:
                 '性別',
                 '齢カテゴリ',
                 'last_finish_order',
-                'has_prev_race_data'
+                'has_prev_race_data',
+                'last_class',
+                '出走頭数',
             ]
         # race_idもあれば残す
         use_cols_with_race_id = use_cols + [col for col in ['race_id'] if col in df.columns]

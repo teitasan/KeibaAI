@@ -8,10 +8,11 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from catboost import CatBoostClassifier
+from catboost import CatBoostClassifier, Pool
 from src.data_collection.load_race_data import combine_race_data
 from src.features.feature_generator import FeatureGenerator
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_curve
+import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,9 @@ def main():
 
     # 5. CatBoostで学習・評価
     logger.info("CatBoostモデルの学習を開始します...")
-    cat_features = [col for col in ['interval_category', '馬場', '騎手', 'has_bad_track_exp', 'クラス', '開催', '芝・ダート', '距離', '性別', '齢カテゴリ'] if col in X_train_model.columns]
+    cat_features = [col for col in [
+        'interval_category', '馬場', '騎手', 'has_bad_track_exp', 'クラス', '開催', '芝・ダート', '距離', '性別', '齢カテゴリ', 'last_class'
+    ] if col in X_train_model.columns]
     base_model = CatBoostClassifier(
         iterations=100,
         random_seed=42,
@@ -329,6 +332,35 @@ def main():
         # display_cols = ['race_id', '馬', 'y_proba', 'y_true']
         # top10 = top10.sort_values('y_proba', ascending=False).head(10)
         # print(top10[display_cols].to_string(index=False))
+
+        # --- SHAP値の計算とsummary plot出力 ---
+        import shap
+        print('SHAP値を計算・可視化します...')
+        # SHAP値の計算（CatBoostは直接対応）
+        from catboost import Pool
+        test_pool = Pool(X_test_model, cat_features=cat_features)
+        shap_values = best_model.get_feature_importance(type='ShapValues', data=test_pool)
+        # shap_valuesのshape: (n_samples, n_features+1) 最後の列はベースライン
+        # summary_plot用にshap_valuesの最後の列を除外
+        shap.summary_plot(
+            shap_values[:, :-1],
+            X_test_model,
+            feature_names=best_model.feature_names_,
+            show=False
+        )
+        import matplotlib.pyplot as plt
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        shap_summary_path = f'shap_summary_{timestamp}.png'
+        plt.tight_layout()
+        plt.savefig(shap_summary_path)
+        plt.close()
+        print(f'SHAP summary plotを{shap_summary_path}として保存しました')
+
+        # --- X_test_modelでrace_idを参照するprint文を削除 ---
+        # --- レースごとの出走頭数サンプルはX_test_with_infoでのみ出力 ---
+        if 'race_id' in X_test_with_info.columns and '出走頭数' in X_test_with_info.columns:
+            print('\n【デバッグ】race_idごとの出走頭数サンプル')
+            print(X_test_with_info[['race_id', '出走頭数']].drop_duplicates().head(10))
 
         return
 

@@ -28,6 +28,12 @@ def load_race_data(year: int) -> pd.DataFrame:
 
     try:
         df = pd.read_csv(file_path, encoding="shift-jis")
+        # カラム名の揺れを吸収
+        if 'レースID' in df.columns and 'race_id' not in df.columns:
+            df.rename(columns={'レースID': 'race_id'}, inplace=True)
+        print(f"DEBUG: columns after possible rename: {df.columns.tolist()}")
+        logger.info(f"DEBUG: Columns loaded by pandas: {df.columns.tolist()}")
+
         # 障害レースを除外（「芝・ダート」列が「障」のデータ）
         initial_len = len(df)
         df = df[df['芝・ダート'] != '障']
