@@ -1,6 +1,11 @@
 """
 CatBoost専用モデル評価スクリプト
 3着以内に入るかどうかを予測
+
+# Optunaによるハイパーパラメータ自動チューニング機能あり
+# RUN_OPTUNA_TUNING = True で有効化できます
+# ※自動チューニングは試行回数やデータ量によっては数十分～数時間かかる場合があります。
+# 時間に余裕があるときに実行するか、他の作業と並行することを推奨します。
 """
 
 import logging
@@ -13,8 +18,38 @@ from src.data_collection.load_race_data import combine_race_data
 from src.features.feature_generator import FeatureGenerator
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_curve
 import datetime
+import optuna
+from sklearn.model_selection import train_test_split
 
 logger = logging.getLogger(__name__)
+
+
+def optuna_tune_catboost(X_train, y_train, cat_features, n_trials=30):
+    """
+    OptunaでCatBoostのハイパーパラメータ自動チューニングを行う関数
+    """
+    from sklearn.metrics import f1_score
+    def objective(trial):
+        params = {
+            'learning_rate': trial.suggest_loguniform('learning_rate', 1e-3, 0.3),
+            'depth': trial.suggest_int('depth', 4, 10),
+            'l2_leaf_reg': trial.suggest_loguniform('l2_leaf_reg', 1, 10),
+            'iterations': trial.suggest_int('iterations', 100, 1000),
+            'random_seed': 42,
+            'eval_metric': 'F1',
+            'verbose': 0,
+        }
+        # train/valid分割
+        X_tr, X_val, y_tr, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
+        model = CatBoostClassifier(**params)
+        model.fit(X_tr, y_tr, eval_set=(X_val, y_val), cat_features=cat_features, early_stopping_rounds=30)
+        y_pred = model.predict(X_val)
+        return f1_score(y_val, y_pred)
+
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials)
+    print('Optuna最良パラメータ:', study.best_params)
+    return study.best_params
 
 
 def main():
@@ -73,6 +108,14 @@ def main():
     cat_features = [col for col in [
         'interval_category', '馬場', '騎手', 'has_bad_track_exp', 'クラス', '開催', '芝・ダート', '距離', '性別', '齢カテゴリ', 'last_class'
     ] if col in X_train_model.columns]
+
+    # --- Optunaによる自動チューニング ---
+    RUN_OPTUNA_TUNING = False  # TrueでOptunaによる自動チューニングを実行
+    if RUN_OPTUNA_TUNING:
+        best_params = optuna_tune_catboost(X_train_model, y_train, cat_features, n_trials=30)
+        print('Optunaで探索した最良パラメータ:', best_params)
+        # 必要に応じてここでreturnしてもOK
+
     base_model = CatBoostClassifier(
         iterations=100,
         random_seed=42,
@@ -355,6 +398,12 @@ def main():
         plt.savefig(shap_summary_path)
         plt.close()
         print(f'SHAP summary plotを{shap_summary_path}として保存しました')
+
+        # --- 追加: SHAP値をテキストファイルに保存 ---
+        # shap_df = pd.DataFrame(shap_values[:, :-1], columns=best_model.feature_names_)
+        # shap_txt_path = 'shap_values.txt'
+        # shap_df.to_csv(shap_txt_path, sep='\t', index=False)
+        # print(f'SHAP値を{shap_txt_path}として保存しました')
 
         # --- X_test_modelでrace_idを参照するprint文を削除 ---
         # --- レースごとの出走頭数サンプルはX_test_with_infoでのみ出力 ---
